@@ -421,7 +421,8 @@ export class SplatMesh extends SplatGenerator {
       options.stream ||
       options.constructSplats ||
       (options.packedSplats && !options.packedSplats.isInitialized) ||
-      (this.extSplats && !this.extSplats.isInitialized)
+      (this.extSplats && !this.extSplats.isInitialized) ||
+      this.paged
     ) {
       // We need to initialize asynchronously given the options
       this.initialized = this.asyncInitialize(options).then(async () => {
@@ -510,10 +511,16 @@ export class SplatMesh extends SplatGenerator {
         await this.extSplats.initialized;
         this.splats = this.extSplats;
       }
+    } else if (this.paged) {
+      const { meta } = await this.paged.getRadMeta();
+      this.numSplats = meta.count;
+      this.splats = this.paged;
     }
 
     if (this.splats) {
-      this.numSplats = this.splats.getNumSplats();
+      if (!this.paged) {
+        this.numSplats = this.splats.getNumSplats();
+      }
       this.updateGenerator();
     }
   }

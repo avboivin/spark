@@ -15,7 +15,7 @@ function float32ToHalf(val: number): number {
   
   let halfExp = exp - 127 + 15;
   if (halfExp >= 0x1f) {
-    return (sign << 15) | 0x7c00;
+    return (sign << 15) | 0x7bff;
   }
   if (halfExp <= 0) {
     if (halfExp < -10) return sign << 15;
@@ -132,6 +132,83 @@ function kmeans2d(data: Float32Array, k: number, maxIters: number = 5): Float32A
   return centroids;
 }
 
+// Rearranges idxArr[lo..hi] in place (Hoare-partition quickselect) so that
+// idxArr[n] ends up holding the element that a full sort by xyz[idx*3+axis]
+// would place there, with everything before n <= it and everything after n
+// >= it (a "nth_element", not a full sort -- O(range) average case).
+function nthElementByAxis(idxArr: Int32Array, lo: number, hi: number, n: number, xyz: Float32Array, axis: number) {
+  while (hi > lo) {
+    const pivotIdx = idxArr[(lo + hi) >> 1];
+    const pivotVal = xyz[pivotIdx * 3 + axis];
+    let i = lo;
+    let j = hi;
+    while (i <= j) {
+      while (xyz[idxArr[i] * 3 + axis] < pivotVal) i++;
+      while (xyz[idxArr[j] * 3 + axis] > pivotVal) j--;
+      if (i <= j) {
+        const tmp = idxArr[i];
+        idxArr[i] = idxArr[j];
+        idxArr[j] = tmp;
+        i++;
+        j--;
+      }
+    }
+    if (n <= j) hi = j;
+    else if (n >= i) lo = i;
+    else break;
+  }
+}
+
+// Splits `idxArr` into spatially-coherent groups of at most `chunkSize`
+// indices each, by recursively picking whichever of x/y/z has the LARGEST
+// extent within the current group and splitting at its median (a k-d tree).
+// This is deliberately NOT a single global sort along one fixed axis: a
+// global lexicographic (z,y,x) sort followed by contiguous count-based
+// slicing produces degenerate chunks whenever point density is highly
+// non-uniform, which real-world captures always are -- e.g. a dense building
+// facade plus a sparse, widely-spread field of background/terrain points. A
+// fixed global sort dominated by z packs the dense region into razor-thin,
+// nearly 2D horizontal slabs (measured directly on a real capture: consecutive
+// chunks spanning as little as 0.9 world units in z, i.e. paper-thin slices of
+// a multi-story building) while the sparse tail dominates one or two chunks
+// with an enormous, near-empty bounding box. Re-picking the split axis at
+// every level based on the ACTUAL shape of the current subgroup adapts to
+// this instead of committing to one axis for the whole scene, so each
+// resulting chunk is a roughly cube-shaped, spatially local region regardless
+// of how lopsided the overall point-density distribution is.
+function kdPartitionIndices(idxArr: Int32Array, xyz: Float32Array, chunkSize: number): Int32Array[] {
+  const groups: Int32Array[] = [];
+  const stack: [number, number][] = [[0, idxArr.length - 1]];
+  while (stack.length) {
+    const [lo, hi] = stack.pop()!;
+    const count = hi - lo + 1;
+    if (count <= chunkSize) {
+      groups.push(idxArr.slice(lo, hi + 1));
+      continue;
+    }
+
+    let minV0 = Infinity, minV1 = Infinity, minV2 = Infinity;
+    let maxV0 = -Infinity, maxV1 = -Infinity, maxV2 = -Infinity;
+    for (let p = lo; p <= hi; p++) {
+      const pt = idxArr[p] * 3;
+      const x = xyz[pt], y = xyz[pt + 1], z = xyz[pt + 2];
+      if (x < minV0) minV0 = x; if (x > maxV0) maxV0 = x;
+      if (y < minV1) minV1 = y; if (y > maxV1) maxV1 = y;
+      if (z < minV2) minV2 = z; if (z > maxV2) maxV2 = z;
+    }
+    const extents = [maxV0 - minV0, maxV1 - minV1, maxV2 - minV2];
+    let axis = 0;
+    if (extents[1] > extents[axis]) axis = 1;
+    if (extents[2] > extents[axis]) axis = 2;
+
+    const mid = lo + (count >> 1);
+    nthElementByAxis(idxArr, lo, hi, mid, xyz, axis);
+    stack.push([lo, mid - 1]);
+    stack.push([mid, hi]);
+  }
+  return groups;
+}
+
 // Huffman Code Table Builder
 interface HuffmanNode {
   symbol?: number;
@@ -219,6 +296,7 @@ export async function convertSplatToSp5Client({
   sh1,
   maxSh,
   onProgress,
+  priorityPoint,
 }: {
   numSplats: number;
   xyz: Float32Array;
@@ -229,6 +307,17 @@ export async function convertSplatToSp5Client({
   sh1?: Float32Array;
   maxSh: number;
   onProgress?: (phase: string, percent: number) => void;
+  // World-space point (in the SOURCE, pre-recenter coordinate space -- same
+  // space as the input `xyz`) to prioritize for fast initial load. Chunk 0 is
+  // fetched unconditionally before any LOD tree exists to discover the rest
+  // of the scene (see worker.ts's synthesizeFlatLodTreeIfMissing), so
+  // whichever spatial region becomes chunk 0 is what appears first,
+  // regardless of where the camera actually starts. If given, the chunk
+  // whose centroid is closest to this point becomes chunk 0 -- e.g. pass
+  // your intended default camera's look-at target/position so the region
+  // visible on load already has its data resident instead of a k-d-tree-order
+  // region unrelated to what the viewer will actually be looking at.
+  priorityPoint?: [number, number, number];
 }): Promise<Uint8Array> {
   const CHUNK_SIZE = 65536;
 
@@ -236,6 +325,27 @@ export async function convertSplatToSp5Client({
   onProgress?.("Sorting coordinates...", 10);
   const sortedIndices = stable_lexicographic_sort_wasm(xyz);
   
+  // Recenter the scene near the origin so coordinates stay within the f16 range
+  // used by Spark's packed splat texture (+/-65504). Use the per-axis MEDIAN, not
+  // the bounding-box midpoint: photogrammetry scenes routinely contain a handful
+  // of extreme floater outliers (this dataset reaches +/-175000 while 99.9% of
+  // splats are within +/-5500). A min/max midpoint would be dragged tens of
+  // thousands of units away by those few points -- e.g. here (minX+maxX)/2 lands
+  // at ~66821 -- shifting the entire scene out of f16 range so every coordinate
+  // overflows to Infinity. The median is robust to such outliers.
+  let cx = 0, cy = 0, cz = 0;
+  if (numSplats > 0) {
+    const axis = new Float32Array(numSplats);
+    const medianOf = (comp: number): number => {
+      for (let i = 0; i < numSplats; i++) axis[i] = xyz[i * 3 + comp];
+      axis.sort();
+      return axis[numSplats >> 1];
+    };
+    cx = medianOf(0);
+    cy = medianOf(1);
+    cz = medianOf(2);
+  }
+
   const sortedXyz = new Float32Array(numSplats * 3);
   const sortedOpacity = new Float32Array(numSplats);
   const sortedRgb = new Float32Array(numSplats * 3);
@@ -245,9 +355,9 @@ export async function convertSplatToSp5Client({
 
   for (let i = 0; i < numSplats; i++) {
     const idx = sortedIndices[i];
-    sortedXyz[i * 3 + 0] = xyz[idx * 3 + 0];
-    sortedXyz[i * 3 + 1] = xyz[idx * 3 + 1];
-    sortedXyz[i * 3 + 2] = xyz[idx * 3 + 2];
+    sortedXyz[i * 3 + 0] = xyz[idx * 3 + 0] - cx;
+    sortedXyz[i * 3 + 1] = xyz[idx * 3 + 1] - cy;
+    sortedXyz[i * 3 + 2] = xyz[idx * 3 + 2] - cz;
 
     sortedOpacity[i] = opacity[idx];
 
@@ -348,23 +458,82 @@ export async function convertSplatToSp5Client({
   });
 
   // 3. Packaging into chunks
-  const numChunks = Math.ceil(numSplats / CHUNK_SIZE);
+  // Partition by actual 3D spatial locality (see kdPartitionIndices above),
+  // not by contiguous ranges of the global (z,y,x) sort order -- the latter
+  // produces degenerate, near-2D chunks whenever the scene's point density is
+  // highly non-uniform (dense building + sparse widely-spread background),
+  // which showed up as "only one direction/slice of the scene visible" and
+  // "95% missing" once loaded, since most chunks ended up covering only a
+  // sub-1-unit-thick horizontal slab of the real content.
+  onProgress?.("Partitioning into spatial chunks...", 75);
+  const allIndices = new Int32Array(numSplats);
+  for (let i = 0; i < numSplats; i++) allIndices[i] = i;
+  const chunkGroups = kdPartitionIndices(allIndices, sortedXyz, CHUNK_SIZE);
+
+  // Chunk 0 is fetched unconditionally, before any LOD tree exists to
+  // discover the rest of the scene -- it's the one region guaranteed to be
+  // visible immediately on load. Left alone, which spatial group lands at
+  // index 0 is just whatever the k-d partition produced first, unrelated to
+  // where a viewer's default camera actually looks. If a priority point was
+  // given, move whichever group's centroid is closest to it into index 0.
+  if (priorityPoint && chunkGroups.length > 1) {
+    const [pcx, pcy, pcz] = [priorityPoint[0] - cx, priorityPoint[1] - cy, priorityPoint[2] - cz];
+    let bestGroup = 0;
+    let bestDist = Infinity;
+    for (let g = 0; g < chunkGroups.length; g++) {
+      const group = chunkGroups[g];
+      let sx = 0, sy = 0, sz = 0;
+      for (let k = 0; k < group.length; k++) {
+        const i = group[k];
+        sx += sortedXyz[i * 3 + 0];
+        sy += sortedXyz[i * 3 + 1];
+        sz += sortedXyz[i * 3 + 2];
+      }
+      const n = group.length;
+      const dx = sx / n - pcx, dy = sy / n - pcy, dz = sz / n - pcz;
+      const dist = dx * dx + dy * dy + dz * dz;
+      if (dist < bestDist) { bestDist = dist; bestGroup = g; }
+    }
+    if (bestGroup !== 0) {
+      [chunkGroups[0], chunkGroups[bestGroup]] = [chunkGroups[bestGroup], chunkGroups[0]];
+    }
+  }
+
+  const numChunks = chunkGroups.length;
   const zipFiles: Record<string, Uint8Array> = {};
   const chunksManifest: any[] = [];
 
   onProgress?.("Packaging .sp5 chunk files...", 80);
   for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-    const start = chunkIdx * CHUNK_SIZE;
-    const count = Math.min(numSplats - start, CHUNK_SIZE);
-    
-    // Chunk slice arrays
-    const chunkXyz = sortedXyz.subarray(start * 3, (start + count) * 3);
-    const chunkOpacity = sortedOpacity.subarray(start, start + count);
-    const chunkRgb = sortedRgb.subarray(start * 3, (start + count) * 3);
-    const chunkSh1 = sortedSh1 ? sortedSh1.subarray(start * 9, (start + count) * 9) : new Float32Array(0);
+    const group = chunkGroups[chunkIdx];
+    const count = group.length;
 
-    const chunkScaleIndices = scaleIndices.map(ind => ind.subarray(start, start + count));
-    const chunkRotIndices = rotIndices.map(ind => ind.subarray(start, start + count));
+    // Chunk arrays, gathered by this group's (spatially local, not
+    // contiguous) set of global-sort-order indices.
+    const chunkXyz = new Float32Array(count * 3);
+    const chunkOpacity = new Float32Array(count);
+    const chunkRgb = new Float32Array(count * 3);
+    const chunkSh1 = sortedSh1 ? new Float32Array(count * 9) : new Float32Array(0);
+    const chunkScaleIndices = [new Uint8Array(count), new Uint8Array(count), new Uint8Array(count)];
+    const chunkRotIndices = [new Uint8Array(count), new Uint8Array(count)];
+    for (let k = 0; k < count; k++) {
+      const i = group[k];
+      chunkXyz[k * 3 + 0] = sortedXyz[i * 3 + 0];
+      chunkXyz[k * 3 + 1] = sortedXyz[i * 3 + 1];
+      chunkXyz[k * 3 + 2] = sortedXyz[i * 3 + 2];
+      chunkOpacity[k] = sortedOpacity[i];
+      chunkRgb[k * 3 + 0] = sortedRgb[i * 3 + 0];
+      chunkRgb[k * 3 + 1] = sortedRgb[i * 3 + 1];
+      chunkRgb[k * 3 + 2] = sortedRgb[i * 3 + 2];
+      if (sortedSh1) {
+        for (let s = 0; s < 9; s++) chunkSh1[k * 9 + s] = sortedSh1[i * 9 + s];
+      }
+      chunkScaleIndices[0][k] = scaleIndices[0][i];
+      chunkScaleIndices[1][k] = scaleIndices[1][i];
+      chunkScaleIndices[2][k] = scaleIndices[2][i];
+      chunkRotIndices[0][k] = rotIndices[0][i];
+      chunkRotIndices[1][k] = rotIndices[1][i];
+    }
 
     // Huffman streams
     const scaleHuffman = chunkScaleIndices.map((ind, c) => encodeHuffman(ind, scaleTables[c]));

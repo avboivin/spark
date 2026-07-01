@@ -1,5 +1,5 @@
-import * as THREE from "three";
 import { unzipSync } from "fflate";
+import * as THREE from "three";
 
 import { decode_rad_header } from "spark-rs";
 import { LN_SCALE_MAX, LN_SCALE_MIN, dyno } from ".";
@@ -18,11 +18,11 @@ import {
 } from "./defines";
 import { type DynoUsampler2DArray, pagedSplatTexCoord } from "./dyno";
 import {
+  SplatCache,
   decodeExtSplat,
   getTextureSize,
   unpackSplat,
   uploadU32DataTextureRows,
-  SplatCache,
 } from "./utils";
 import * as wasm from "./wasm";
 
@@ -45,9 +45,13 @@ export class HttpChunkSource implements ChunkSource {
   constructor(
     private url: string,
     private requestHeader?: Record<string, string>,
-    private withCredentials?: boolean
+    private withCredentials?: boolean,
   ) {}
-  async read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array> {
+  async read(
+    offset?: number,
+    bytes?: number,
+    filename?: string,
+  ): Promise<Uint8Array> {
     return fetchRange({
       url: this.url,
       requestHeader: this.requestHeader,
@@ -60,10 +64,15 @@ export class HttpChunkSource implements ChunkSource {
 
 export class BlobChunkSource implements ChunkSource {
   constructor(private blob: Blob) {}
-  async read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array> {
-    const sliced = offset !== undefined && bytes !== undefined
-      ? this.blob.slice(offset, offset + bytes)
-      : this.blob;
+  async read(
+    offset?: number,
+    bytes?: number,
+    filename?: string,
+  ): Promise<Uint8Array> {
+    const sliced =
+      offset !== undefined && bytes !== undefined
+        ? this.blob.slice(offset, offset + bytes)
+        : this.blob;
     return new Uint8Array(await sliced.arrayBuffer());
   }
 }
@@ -73,7 +82,11 @@ export class ZipChunkSource implements ChunkSource {
   constructor(zipBytes: Uint8Array) {
     this.files = unzipSync(zipBytes);
   }
-  async read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array> {
+  async read(
+    offset?: number,
+    bytes?: number,
+    filename?: string,
+  ): Promise<Uint8Array> {
     if (!filename) {
       throw new Error("ZipChunkSource requires a filename");
     }
@@ -109,6 +122,10 @@ export class PagedSplats implements SplatSource {
   numSplats: number;
   splatEncoding?: SplatEncoding;
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
+  // Synchronous cache of the resolved manifest, populated once getRadMeta()'s
+  // promise settles. Used by SparkRenderer to decide fetch priority without
+  // re-awaiting an (already-resolved) promise on every frame.
+  cachedMeta?: RadMeta;
 
   dynoNumSplats: dyno.DynoInt<"numSplats">;
   dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -186,7 +203,7 @@ export class PagedSplats implements SplatSource {
       this.chunkSource = new HttpChunkSource(
         this.rootUrl,
         this.requestHeader,
-        this.withCredentials
+        this.withCredentials,
       );
     }
 
@@ -226,12 +243,21 @@ export class PagedSplats implements SplatSource {
           this.chunkSource = new ZipChunkSource(new Uint8Array(buffer));
         }
         if (this.chunkSource instanceof ZipChunkSource) {
-          const manifestBytes = await this.chunkSource.read(0, 0, "manifest.json");
+          const manifestBytes = await this.chunkSource.read(
+            0,
+            0,
+            "manifest.json",
+          );
           const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
           return { meta: manifest, chunksStart: 0 };
         } else if (this.rootUrl) {
-          const resolvedRoot = new URL(this.rootUrl, window.location.href).toString();
-          const manifestUrl = resolvedRoot.endsWith(".json") ? resolvedRoot : new URL("manifest.json", resolvedRoot).toString();
+          const resolvedRoot = new URL(
+            this.rootUrl,
+            window.location.href,
+          ).toString();
+          const manifestUrl = resolvedRoot.endsWith(".json")
+            ? resolvedRoot
+            : new URL("manifest.json", resolvedRoot).toString();
           const response = await fetch(manifestUrl);
           const manifest = await response.json();
           return { meta: manifest, chunksStart: 0 };
@@ -243,8 +269,12 @@ export class PagedSplats implements SplatSource {
       }
 
       if (this.fileType !== SplatFileType.RAD) {
-        const spotId = this.rootUrl || (this.fileBlob as any)?.name || (this.fileBytes as any)?.name || "local-drop";
-        const cacheKey = `local-drop-${spotId}-${(this.fileBlob as any)?.size || this.fileBytes?.length || 0}`;
+        const spotId =
+          this.rootUrl ||
+          (this.fileBlob as any)?.name ||
+          (this.fileBytes as any)?.name ||
+          "local-drop";
+        const cacheKey = `local-drop-v6-${spotId}-${(this.fileBlob as any)?.size || this.fileBytes?.length || 0}`;
 
         const cachedManifest = await SplatCache.getManifest(cacheKey);
         if (cachedManifest) {
@@ -260,7 +290,10 @@ export class PagedSplats implements SplatSource {
             pathName: spotId,
             lodBase: this.pager?.maxSh ?? 1.5,
           });
-        })) as { manifest: RadMeta; chunks: { chunk: number; bytes: Uint8Array; numSplats: number }[] };
+        })) as {
+          manifest: RadMeta;
+          chunks: { chunk: number; bytes: Uint8Array; numSplats: number }[];
+        };
 
         await SplatCache.putManifest(cacheKey, result.manifest);
         for (const chunk of result.chunks) {
@@ -287,6 +320,7 @@ export class PagedSplats implements SplatSource {
       }
       throw new Error("Failed to decode RAD header");
     })().then((metaStart) => {
+      this.cachedMeta = metaStart.meta;
       return metaStart;
     });
 
@@ -302,9 +336,18 @@ export class PagedSplats implements SplatSource {
   }
 
   async fetchDecodeChunk(chunk: number) {
-    const spotId = this.rootUrl || (this.fileBlob as any)?.name || (this.fileBytes as any)?.name || "local-drop";
+    await this.getRadMeta();
+    const spotId =
+      this.rootUrl ||
+      (this.fileBlob as any)?.name ||
+      (this.fileBytes as any)?.name ||
+      "local-drop";
     let decodeBytes = await SplatCache.getChunk(spotId, chunk);
     const cacheHit = decodeBytes !== null;
+    console.log(
+      `fetchDecodeChunk: chunk=${chunk}, spotId=${spotId}, cacheHit=${cacheHit}` +
+        (cacheHit ? `, cachedBytes=${decodeBytes!.length}` : ""),
+    );
 
     if (!cacheHit) {
       if (this.fileType === SplatFileType.RAD) {
@@ -340,12 +383,16 @@ export class PagedSplats implements SplatSource {
         }
       } else if (this.fileBytes) {
         // Fall through
-      } else if (this.rootUrl) {
+      } else if (this.rootUrl && !this.rootUrl.startsWith("local-drop")) {
         let url = this.chunkUrl(chunk);
         if (this.fileType === SplatFileType.SP5) {
           const { meta } = await this.getRadMeta();
-          const filename = (meta.chunks[chunk] as any).file || `scene-lod-${chunk}.sp5`;
-          const resolvedRoot = new URL(this.rootUrl, window.location.href).toString();
+          const filename =
+            (meta.chunks[chunk] as any).file || `scene-lod-${chunk}.sp5`;
+          const resolvedRoot = new URL(
+            this.rootUrl,
+            window.location.href,
+          ).toString();
           const lastSlash = resolvedRoot.lastIndexOf("/");
           url = resolvedRoot.slice(0, lastSlash + 1) + filename;
         }
@@ -364,7 +411,8 @@ export class PagedSplats implements SplatSource {
         decodeBytes = new Uint8Array(await response.arrayBuffer());
       } else if (this.fileType === SplatFileType.SP5) {
         const { meta } = await this.getRadMeta();
-        const filename = (meta.chunks[chunk] as any).file || `scene-lod-${chunk}.sp5`;
+        const filename =
+          (meta.chunks[chunk] as any).file || `scene-lod-${chunk}.sp5`;
         if (this.chunkSource) {
           decodeBytes = await this.chunkSource.read(0, 0, filename);
         } else {
@@ -383,8 +431,39 @@ export class PagedSplats implements SplatSource {
       }
       let lodSplats: PackedResult | ExtResult = null as any;
       if (this.fileType === SplatFileType.SP5) {
+        // Chunk 0 is the only chunk guaranteed to become the traversal root
+        // (SparkRenderer.ts sets record.rootPage from whichever upload has
+        // chunk === 0), so it's the only one that needs sibling-chunk
+        // pointers stitched into its synthesized tree -- see
+        // synthesizeFlatLodTreeIfMissing's doc comment in worker.ts for why
+        // every other chunk is otherwise completely unreachable by
+        // traversal. The manifest already has every chunk's aabb/count from
+        // conversion time, so this needs no extra fetch.
+        let siblingChunks:
+          | { chunkIndex: number; center: [number, number, number]; size: number }[]
+          | undefined;
+        if (chunk === 0) {
+          const { meta } = await this.getRadMeta();
+          siblingChunks = (meta.chunks as any[])
+            .map((c, idx) => ({ c, idx }))
+            .filter(({ c, idx }) => idx !== 0 && Array.isArray(c.aabb) && c.aabb.length === 6)
+            .map(({ c, idx }) => {
+              const [minX, minY, minZ, maxX, maxY, maxZ] = c.aabb;
+              const center: [number, number, number] = [
+                (minX + maxX) / 2,
+                (minY + maxY) / 2,
+                (minZ + maxZ) / 2,
+              ];
+              const size = Math.max(
+                Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2,
+                1e-4,
+              );
+              return { chunkIndex: idx, center, size };
+            });
+        }
         const result = (await worker.call("decodeSp5Chunk", {
           chunkBytes: decodeBytes!.slice(),
+          siblingChunks,
         })) as PackedResult;
         lodSplats = result;
       } else if (!this.pager.extSplats) {
@@ -425,12 +504,20 @@ export class PagedSplats implements SplatSource {
             this.splatEncoding.sh2Max ?? 1.0,
             this.splatEncoding.sh3Max ?? 1.0,
           );
+          console.log(
+            `[pager-encoding] splatEncoding configured: numSh=${this.numSh}, ` +
+              `rgbMinMax=(${this.splatEncoding.rgbMin},${this.splatEncoding.rgbMax}), ` +
+              `shMax=(${this.splatEncoding.sh1Max},${this.splatEncoding.sh2Max},${this.splatEncoding.sh3Max}), ` +
+              `lodOpacity=${this.splatEncoding.lodOpacity}`,
+          );
         }
         this.sh1Codes = packed.extra.sh1Codes ?? this.sh1Codes;
         this.sh2Codes = packed.extra.sh2Codes ?? this.sh2Codes;
         this.sh3Codes = packed.extra.sh3Codes ?? this.sh3Codes;
       } else {
-        const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
+        const sh3Codes = this.sh3Codes as
+          | [Uint32Array, Uint32Array]
+          | undefined;
         const result = (await worker.call("loadExtSplats", {
           fileBytes: decodeBytes!.slice(),
           pathName: this.chunkUrl(chunk),
@@ -465,7 +552,7 @@ export class PagedSplats implements SplatSource {
           0,
           decodeBytes,
           lodSplats.numSplats,
-          this.pager.maxCacheSplats
+          this.pager.maxCacheSplats,
         );
       }
 
@@ -612,6 +699,9 @@ export class PagedSplats implements SplatSource {
       extPackedSplatArray,
     ];
 
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
     for (let i = 0; i < this.numSplats; ++i) {
       const splatIndex = indices[i];
       const unpacked = extSplats
@@ -625,7 +715,29 @@ export class PagedSplats implements SplatSource {
         unpacked.opacity,
         unpacked.color,
       );
+      const cx = unpacked.center.x;
+      const cy = unpacked.center.y;
+      const cz = unpacked.center.z;
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy;
+      if (cy > maxY) maxY = cy;
+      if (cz < minZ) minZ = cz;
+      if (cz > maxZ) maxZ = cz;
     }
+    const hasInfNaN =
+      !isFinite(minX) || !isFinite(maxX) ||
+      !isFinite(minY) || !isFinite(maxY) ||
+      !isFinite(minZ) || !isFinite(maxZ);
+    console.log(
+      `[forEachSplat] iterated ${this.numSplats} splats, position range: ` +
+        `x=[${minX.toFixed(3)}, ${maxX.toFixed(3)}] ` +
+        `y=[${minY.toFixed(3)}, ${maxY.toFixed(3)}] ` +
+        `z=[${minZ.toFixed(3)}, ${maxZ.toFixed(3)}]` +
+        (hasInfNaN
+          ? " -- CRITICAL: positions contain Infinity or NaN, vertices will not render correctly"
+          : ""),
+    );
   }
 }
 
@@ -1148,7 +1260,11 @@ export class SplatPager {
     extArray?: Uint32Array,
   ) {
     const pageBase = page * PAGE_SPLATS;
-    console.log(`uploadPage: page=${page}, pageBase=${pageBase}, packedArray.length=${packedArray.length}, numShArrays=${shArrays.length}`);
+    const nonZero = packedArray.filter((v) => v !== 0).length;
+    console.log(
+      `uploadPage: page=${page}, pageBase=${pageBase}, packedArray.length=${packedArray.length}, numShArrays=${shArrays.length}, nonZeroWords=${nonZero}/${packedArray.length}` +
+        (nonZero === 0 ? " -- WARNING: packed array is all zeros, rendering will produce nothing" : ""),
+    );
 
     uploadTextureLayer(this.packedTexture, page, pageBase * 4, packedArray);
 
@@ -1300,14 +1416,29 @@ export class SplatPager {
           continue;
         }
 
-        const spotId = splats.rootUrl || (splats.fileBlob as any)?.name || (splats.fileBytes as any)?.name || "local-drop";
+        const spotId =
+          splats.rootUrl ||
+          (splats.fileBlob as any)?.name ||
+          (splats.fileBytes as any)?.name ||
+          "local-drop";
         for (let chunk = 0; chunk < meta.chunks.length; chunk++) {
           if (this.fetchers.length >= this.numFetchers) return;
 
           // Check if already in priority list, fetching, or fetched
-          if (this.fetchPriority.some((p) => p.splats === splats && p.chunk === chunk)) continue;
-          if (this.fetchers.some((p) => p.splats === splats && p.chunk === chunk)) continue;
-          if (this.fetched.some((p) => p.splats === splats && p.chunk === chunk)) continue;
+          if (
+            this.fetchPriority.some(
+              (p) => p.splats === splats && p.chunk === chunk,
+            )
+          )
+            continue;
+          if (
+            this.fetchers.some((p) => p.splats === splats && p.chunk === chunk)
+          )
+            continue;
+          if (
+            this.fetched.some((p) => p.splats === splats && p.chunk === chunk)
+          )
+            continue;
           if (this.splatsChunkToPage.get(splats)?.[chunk]) continue;
 
           // Query cache
@@ -1315,7 +1446,12 @@ export class SplatPager {
           if (cached !== null) continue; // Already in cache!
 
           // Fetch and cache in background!
-          this.prefetchChunk(splats, chunk, spotId, meta.chunks[chunk].count || 0);
+          this.prefetchChunk(
+            splats,
+            chunk,
+            spotId,
+            meta.chunks[chunk].count || 0,
+          );
         }
       }
     }
@@ -1334,7 +1470,10 @@ export class SplatPager {
           const { meta, chunksStart } = await splats.getRadMeta();
           const { offset, bytes: byteCount, filename } = meta.chunks[chunk];
           if (filename) {
-            const resolvedRoot = new URL(splats.rootUrl, window.location.href).toString();
+            const resolvedRoot = new URL(
+              splats.rootUrl,
+              window.location.href,
+            ).toString();
             const chunkUrl = new URL(filename, resolvedRoot).toString();
             bytes = await fetchRange({
               url: chunkUrl,
@@ -1343,7 +1482,10 @@ export class SplatPager {
             });
           } else {
             if (splats.chunkSource) {
-              bytes = await splats.chunkSource.read(offset + chunksStart, byteCount);
+              bytes = await splats.chunkSource.read(
+                offset + chunksStart,
+                byteCount,
+              );
             } else {
               return;
             }
@@ -1351,7 +1493,9 @@ export class SplatPager {
         } else {
           const url = splats.chunkUrl(chunk);
           const response = await fetch(url, {
-            headers: splats.requestHeader ? new Headers(splats.requestHeader) : undefined,
+            headers: splats.requestHeader
+              ? new Headers(splats.requestHeader)
+              : undefined,
             credentials: splats.withCredentials ? "include" : "same-origin",
           });
           bytes = new Uint8Array(await response.arrayBuffer());
@@ -1423,11 +1567,34 @@ export class SplatPager {
 
       this.insertSplatsChunkPage(splats, chunk, page, now);
       const { numSplats, extra } = data;
+      // decodeSp5Chunk synthesizes a chunk-relative flat lod tree (root entry's
+      // child_start = 1, meaning "next slot in this same chunk") since it doesn't
+      // know its own chunk index. Patch that to the real absolute address here,
+      // where `chunk` is known, before this data reaches the WASM lod tree.
+      // Deliberately CHUNK-based, not page-based: traverse_lod_trees /
+      // dynamic_traverse_lod_trees (rust/spark-rs/src/lod_tree.rs) read
+      // `child_start >> 16` as a manifest CHUNK index and translate it to a
+      // physical page via `chunk_to_page[]` at traversal time -- that
+      // indirection is exactly what lets a pointer baked in before a chunk's
+      // final page assignment is known stay valid once it lands wherever
+      // concurrent fetching happens to place it. (An earlier version of this
+      // comment claimed this should use `page` instead -- that was wrong and
+      // was reverted; verify against lod_tree.rs before changing this again.)
+      if (extra.lodTree && extra.lodTree.length >= 4) {
+        extra.lodTree[3] = (chunk * PAGE_SPLATS + extra.lodTree[3]) >>> 0;
+      }
+      console.log(
+        `[lod-tree-update] pushing lodTreeUpdates entry: page=${page}, chunk=${chunk}, ` +
+          `numSplats=${numSplats}, hasLodTree=${!!extra.lodTree}` +
+          (numSplats
+            ? ""
+            : " -- WARNING: numSplats is falsy, this page will not become visible/measurable even though it uploaded"),
+      );
       this.lodTreeUpdates.push({
         splats,
         page,
         chunk,
-        numSplats,
+        numSplats: extra.lodTree ? extra.lodTree.length / 4 : numSplats,
         lodTree: extra.lodTree as Uint32Array,
       });
 

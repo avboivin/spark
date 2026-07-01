@@ -1732,13 +1732,14 @@ export class SplatCache {
       return new Promise((resolve, reject) => {
         const transaction = db.transaction("manifests", "readwrite");
         const store = transaction.objectStore("manifests");
-        const request = store.put({
+        store.put({
           spotId,
           manifest,
           cachedAt: Date.now()
         });
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(new Error("Transaction aborted"));
       });
     } catch (err) {
       console.warn("SplatCache.putManifest failed:", err);
@@ -1786,7 +1787,7 @@ export class SplatCache {
       return new Promise((resolve, reject) => {
         const transaction = db.transaction("chunks", "readwrite");
         const store = transaction.objectStore("chunks");
-        const request = store.put({
+        store.put({
           spotId,
           chunkIndex,
           lod,
@@ -1796,8 +1797,9 @@ export class SplatCache {
           cachedAt: Date.now(),
           lastAccessedAt: Date.now()
         });
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(new Error("Transaction aborted"));
       });
     } catch (err) {
       console.warn("SplatCache.putChunk failed:", err);

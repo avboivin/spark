@@ -11,7 +11,7 @@ import {
 import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatGeometry } from "./SplatGeometry";
 import { SplatWorker } from "./SplatWorker";
-import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
+import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH, SplatFileType } from "./defines";
 import { getShaders } from "./shaders";
 import {
   cloneClock,
@@ -1196,7 +1196,7 @@ export class SparkRenderer extends THREE.Mesh {
             generator instanceof SplatMesh &&
             (generator.packedSplats?.lodSplats ||
               generator.extSplats?.lodSplats ||
-              generator.paged) &&
+              (generator.paged && generator.isInitialized)) &&
             generator.enableLod !== false
           );
         }) as SplatMesh[]);
@@ -1284,7 +1284,18 @@ export class SparkRenderer extends THREE.Mesh {
         for (const { splats, page, chunk, numSplats, lodTree } of updates) {
           const record = this.lodIds.get(splats);
           if (record) {
-            if (lodTree && chunk === 0) {
+            // Root-cause fix: `record.rootPage` must be set whenever chunk 0 uploads,
+            // regardless of whether this source has an actual hierarchical LOD tree.
+            // The previous `lodTree &&` guard meant flat/non-hierarchical sources
+            // (e.g. SP5's `lodTree: false` manifest) never got a rootPage assigned,
+            // which permanently excluded them from `instances` in the traversal-input
+            // reduce below (`record.rootPage === undefined` -> skipped) -- so they never
+            // appeared in traverseLodTrees' output, numSplats stayed 0 forever, and both
+            // getBoundingBox() and rendering were starved even after real chunk data
+            // uploaded. For real LOD-tree sources this is a no-op change: chunk 0 for
+            // those always carries lodTree data already, so the condition was already
+            // true whenever chunk === 0 for them.
+            if (chunk === 0) {
               record.rootPage = page;
             }
             this.lodUpdates.push({
@@ -1294,6 +1305,14 @@ export class SparkRenderer extends THREE.Mesh {
               count: numSplats,
               lodTreeData: lodTree,
             });
+            console.log(
+              `[lod-tree-update] queued updateLodTrees range: lodId=${record.lodId}, ` +
+                `page=${page}, chunk=${chunk}, count=${numSplats}`,
+            );
+          } else {
+            console.warn(
+              `[lod-tree-update] WARNING: no lodIds record found for this splats source (page=${page}, chunk=${chunk}, numSplats=${numSplats}) -- this update is being silently dropped, meaning the WASM lod tree never learns this page's splat count. Was initLodTree/newSharedLodTree ever called for this mesh?`,
+            );
           }
         }
       }
@@ -1506,6 +1525,32 @@ export class SparkRenderer extends THREE.Mesh {
         }
       }
 
+      // SP5 manifests have no real cross-chunk hierarchy: each chunk gets its
+      // own independent, chunk-LOCAL synthetic LOD tree (root + leaves all
+      // within that one chunk, see worker.ts's synthesizeFlatLodTreeIfMissing)
+      // since a plain .spz/.sp5 chunk has no field to carry real tree data.
+      // Chunk 0's synthetic tree has zero pointers into chunks 1..N, so the
+      // `chunks` list above -- derived entirely from tree traversal -- can
+      // never discover them: only chunk 0 (a fraction of the scene equal to
+      // 1/numChunks) was ever requested, which is exactly what measured as
+      // "95% of the scene missing" on a real 32-chunk conversion. Since there
+      // is no real hierarchy to traverse for SP5, request every chunk the
+      // manifest declares up front instead of waiting for tree discovery that
+      // will never happen; driveFetchers() still throttles/prioritizes by the
+      // existing distance-sorted order and per-frame fetcher/page budgets.
+      for (const { splats } of pagedMeshes) {
+        if (
+          splats instanceof PagedSplats &&
+          splats.fileType === SplatFileType.SP5 &&
+          splats.cachedMeta
+        ) {
+          const numChunks = splats.cachedMeta.chunks?.length ?? 0;
+          for (let chunk = 1; chunk < numChunks; chunk++) {
+            this.pager.fetchPriority.push({ splats, chunk });
+          }
+        }
+      }
+
       this.pager.autoDrive = this.enableLodFetching;
       if (this.enableLodFetching) {
         this.pager.driveFetchers();
@@ -1580,6 +1625,8 @@ export class SparkRenderer extends THREE.Mesh {
     // console.log("disposed lodTree", oldest.lodId);
   }
 
+  private lastLoggedNumSplats = new Map<string, number>();
+
   private updateLodIndices(
     uuidToMesh: Map<string, SplatMesh>,
     keyIndices: Record<
@@ -1587,7 +1634,21 @@ export class SparkRenderer extends THREE.Mesh {
       { lodId: number; numSplats: number; indices: Uint32Array }
     >,
   ) {
-    // console.log("updateLodIndices", keyIndices);
+    // This runs every animation frame -- only log when a mesh's numSplats actually
+    // changes, so this closes the loop on the [lod-tree-update] logs above without
+    // flooding the console at 60fps.
+    for (const [uuid, { numSplats }] of Object.entries(keyIndices)) {
+      if (this.lastLoggedNumSplats.get(uuid) !== numSplats) {
+        this.lastLoggedNumSplats.set(uuid, numSplats);
+        console.log(
+          `[lod-tree-update] traverseLodTrees result for mesh ${uuid}: numSplats=${numSplats}${
+            numSplats === 0
+              ? " -- this mesh will render nothing and getBoundingBox() will stay empty until this becomes non-zero"
+              : ""
+          }`,
+        );
+      }
+    }
     for (const [uuid, countIndices] of Object.entries(keyIndices)) {
       const { lodId, numSplats, indices } = countIndices;
       const mesh = uuidToMesh.get(uuid) as SplatMesh;

@@ -306,6 +306,21 @@ async function loadPackedSplats(
       sendStatus,
     });
     const result = toPackedResult(decoded as DecodedPackedResult);
+    // Same fix as decodeSp5Chunk: this plain (non-LOD) decode path is also what
+    // partitionDroppedMonolithic's per-chunk .spz re-encode goes through when a
+    // locally-dropped .ply file's chunks get loaded, and its result never
+    // carries real lod tree data either -- see synthesizeFlatLodTreeIfMissing
+    // for the full explanation.
+    synthesizeFlatLodTreeIfMissing(result, result.numSplats, (i) => {
+      const packed = result.packedArray;
+      const word1 = packed[i * 4 + 1];
+      const word2 = packed[i * 4 + 2];
+      return [
+        halfToFloat(word1 & 0xffff),
+        halfToFloat((word1 >>> 16) & 0xffff),
+        halfToFloat(word2 & 0xffff),
+      ];
+    });
     if (result.splatEncoding.lodOpacity) {
       return { lodSplats: result };
     }
@@ -467,6 +482,16 @@ async function loadExtSplats(
       sendStatus,
     });
     const result = toExtResult(decoded as DecodedExtResult);
+    synthesizeFlatLodTreeIfMissing(result, result.numSplats, (i) => {
+      const packed = result.extArrays[0];
+      const word1 = packed[i * 4 + 1];
+      const word2 = packed[i * 4 + 2];
+      return [
+        halfToFloat(word1 & 0xffff),
+        halfToFloat((word1 >>> 16) & 0xffff),
+        halfToFloat(word2 & 0xffff),
+      ];
+    });
     if (result.extra.lodTree) {
       return { lodSplats: result };
     }
@@ -904,7 +929,11 @@ async function partitionDroppedMonolithic(
   })) as any;
 
   const numSplats = gsplatArray.len();
-  console.log(`Loaded ${numSplats} splats. Starting Tiny LoD build...`);
+  console.log(`Loaded ${numSplats} splats. Centering coordinates...`);
+  const centerShift = gsplatArray.center();
+  console.log(`Centered coordinates by: (${centerShift[0].toFixed(3)}, ${centerShift[1].toFixed(3)}, ${centerShift[2].toFixed(3)})`);
+
+  console.log(`Starting Tiny LoD build...`);
 
   const base = Math.max(1.1, Math.min(2.0, lodBase ?? 1.5));
   gsplatArray.tiny_lod(base, false);
@@ -912,9 +941,12 @@ async function partitionDroppedMonolithic(
   const totalNumSplats = gsplatArray.len();
   const CHUNK_SIZE = 65536;
   const numChunks = Math.ceil(totalNumSplats / CHUNK_SIZE);
-  console.log(`Slicing and compressing ${totalNumSplats} splats into ${numChunks} chunks...`);
+  console.log(
+    `Slicing and compressing ${totalNumSplats} splats into ${numChunks} chunks...`,
+  );
 
-  const chunksInfo: { chunk: number; bytes: Uint8Array; numSplats: number }[] = [];
+  const chunksInfo: { chunk: number; bytes: Uint8Array; numSplats: number }[] =
+    [];
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const start = chunk * CHUNK_SIZE;
@@ -923,6 +955,12 @@ async function partitionDroppedMonolithic(
     const subset = gsplatArray.clone_subset(start, count);
     const spzBytes = subset.to_spz();
     subset.free();
+
+    if (chunk % 4 === 0 || chunk === numChunks - 1) {
+      console.log(
+        `[partition] chunk ${chunk + 1}/${numChunks}: ${count} splats, ${spzBytes.length} bytes`,
+      );
+    }
 
     chunksInfo.push({
       chunk,
@@ -956,7 +994,8 @@ async function partitionDroppedMonolithic(
 let tmc3Module: any = null;
 async function ensureTmc3Loaded() {
   if (tmc3Module) return;
-  const tmc3WasmUrl = new URL("../examples/viewer/tmc3.wasm", import.meta.url).href;
+  const tmc3WasmUrl = new URL("../examples/viewer/tmc3.wasm", import.meta.url)
+    .href;
   const tmc3JsUrl = new URL("../examples/viewer/tmc3.js", import.meta.url).href;
   (self as any).Module = {
     INITIAL_MEMORY: 536870912,
@@ -975,7 +1014,15 @@ async function ensureTmc3Loaded() {
   }
 }
 
-async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
+async function decodeSp5Chunk({
+  chunkBytes,
+  siblingChunks,
+}: {
+  chunkBytes: Uint8Array;
+  // Only passed for chunk 0 -- see synthesizeFlatLodTreeIfMissing's doc
+  // comment for why chunk 0's tree specifically needs to reach every sibling.
+  siblingChunks?: { chunkIndex: number; center: [number, number, number]; size: number }[];
+}) {
   const view = new DataView(chunkBytes.buffer, chunkBytes.byteOffset);
   const magic = view.getUint32(0, true);
   if (magic !== 0x355a5053) {
@@ -1066,7 +1113,7 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
     const countMatch = headerText
       .substring(0, headerEnd)
       .match(/element vertex (\d+)/);
-    count = countMatch ? parseInt(countMatch[1]) : 0;
+    count = countMatch ? Number.parseInt(countMatch[1]) : 0;
 
     const isUint16 =
       headerText.includes("property uint16") ||
@@ -1109,28 +1156,17 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
       const normY = y / 65535.0;
       const normZ = z / 65535.0;
 
-      xyzRawFloat[i * 3 + 0] = normX * (meansMax[0] - meansMin[0]) + meansMin[0];
-      xyzRawFloat[i * 3 + 1] = normY * (meansMax[1] - meansMin[1]) + meansMin[1];
-      xyzRawFloat[i * 3 + 2] = normZ * (meansMax[2] - meansMin[2]) + meansMin[2];
+      xyzRawFloat[i * 3 + 0] =
+        normX * (meansMax[0] - meansMin[0]) + meansMin[0];
+      xyzRawFloat[i * 3 + 1] =
+        normY * (meansMax[1] - meansMin[1]) + meansMin[1];
+      xyzRawFloat[i * 3 + 2] =
+        normZ * (meansMax[2] - meansMin[2]) + meansMin[2];
     }
   }
 
-  function halfToFloat(binary: number) {
-    const exponent = (binary & 0x7c00) >> 10;
-    const fraction = binary & 0x03ff;
-    if (exponent === 0) {
-      return (
-        (binary & 0x8000 ? -1 : 1) * Math.pow(2, -14) * (fraction / 1024)
-      );
-    } else if (exponent === 0x1f) {
-      return fraction ? NaN : binary & 0x8000 ? -Infinity : Infinity;
-    }
-    return (
-      (binary & 0x8000 ? -1 : 1) *
-      Math.pow(2, exponent - 15) *
-      (1 + fraction / 1024)
-    );
-  }
+  // halfToFloat moved to module scope (used by both decodeSp5Chunk and
+  // loadPackedSplats's flat-lod-tree synthesis, see synthesizeFlatLodTreeIfMissing below).
 
   function decodeHuffman(
     bytes: Uint8Array,
@@ -1139,7 +1175,7 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
   ) {
     const table = new Map<string, number>();
     for (const [symbol, [len, bits]] of Object.entries(htable)) {
-      table.set(`${bits},${len}`, parseInt(symbol));
+      table.set(`${bits},${len}`, Number.parseInt(symbol));
     }
     const out = new Uint16Array(count);
     let outIdx = 0;
@@ -1211,10 +1247,7 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
 
   const scaleCbFlat = new Float32Array(manifest.scale_codebook.length * 256);
   manifest.scale_codebook.forEach((meta: any, idx: number) => {
-    scaleCbFlat.set(
-      float16ArrayToFloat32Array(getBinaryPart(meta)),
-      idx * 256,
-    );
+    scaleCbFlat.set(float16ArrayToFloat32Array(getBinaryPart(meta)), idx * 256);
   });
 
   const rotationCbFlat = new Float32Array(
@@ -1229,10 +1262,7 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
 
   const appCbFlat = new Float32Array(manifest.app_codebook.length * 512);
   manifest.app_codebook.forEach((meta: any, idx: number) => {
-    appCbFlat.set(
-      float16ArrayToFloat32Array(getBinaryPart(meta)),
-      idx * 512,
-    );
+    appCbFlat.set(float16ArrayToFloat32Array(getBinaryPart(meta)), idx * 512);
   });
 
   const mlpCont = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_cont));
@@ -1252,14 +1282,30 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
   let mlpOffsetB3 = new Float32Array(0);
 
   if (manifest.mlp_offset && Object.keys(manifest.mlp_offset).length > 0) {
-    mlpOffsetW0 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.0.weight"]));
-    mlpOffsetB0 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.0.bias"]));
-    mlpOffsetW1 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.2.weight"]));
-    mlpOffsetB1 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.2.bias"]));
-    mlpOffsetW2 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.4.weight"]));
-    mlpOffsetB2 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.4.bias"]));
-    mlpOffsetW3 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["shs_output.0.weight"]));
-    mlpOffsetB3 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["shs_output.0.bias"]));
+    mlpOffsetW0 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["main.0.weight"]),
+    );
+    mlpOffsetB0 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["main.0.bias"]),
+    );
+    mlpOffsetW1 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["main.2.weight"]),
+    );
+    mlpOffsetB1 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["main.2.bias"]),
+    );
+    mlpOffsetW2 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["main.4.weight"]),
+    );
+    mlpOffsetB2 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["main.4.bias"]),
+    );
+    mlpOffsetW3 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["shs_output.0.weight"]),
+    );
+    mlpOffsetB3 = float16ArrayToFloat32Array(
+      getBinaryPart(manifest.mlp_offset["shs_output.0.bias"]),
+    );
   }
 
   const gsplatArray = reconstruct_sp5_chunk(
@@ -1284,9 +1330,307 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
     mlpOffsetB3,
   );
 
-  const result = toPackedResult(gsplatArray.to_packedsplats(null as any) as any);
+  const result = toPackedResult(
+    gsplatArray.to_packedsplats(null as any) as any,
+  );
   gsplatArray.free();
+
+  // Diagnostic: confirm decoded geometry is actually non-degenerate before it ever
+  // reaches the render/camera pipeline. A camera-fit bug and an "all positions are
+  // zero" decode bug both manifest as a black screen with no thrown error -- this
+  // distinguishes them directly from the console instead of guessing.
+  {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let minZ = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    let maxZ = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < count; i++) {
+      const x = xyzRawFloat[i * 3 + 0];
+      const y = xyzRawFloat[i * 3 + 1];
+      const z = xyzRawFloat[i * 3 + 2];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+    const isDegenerate =
+      maxX - minX < 1e-9 && maxY - minY < 1e-9 && maxZ - minZ < 1e-9;
+    console.log(
+      `[decodeSp5Chunk] decoded ${count} splats, position range: ` +
+        `x=[${minX.toFixed(3)}, ${maxX.toFixed(3)}] ` +
+        `y=[${minY.toFixed(3)}, ${maxY.toFixed(3)}] ` +
+        `z=[${minZ.toFixed(3)}, ${maxZ.toFixed(3)}]${
+          isDegenerate
+            ? " -- WARNING: all positions identical/degenerate, this chunk will not be visible regardless of camera position"
+            : ""
+        }`,
+    );
+
+    synthesizeFlatLodTreeIfMissing(
+      result,
+      count,
+      (i) => [
+        xyzRawFloat[i * 3 + 0],
+        xyzRawFloat[i * 3 + 1],
+        xyzRawFloat[i * 3 + 2],
+      ],
+      siblingChunks,
+    );
+  }
+
   return result;
+}
+
+// Root-cause fix for the traverse_lod_trees panic ("index out of bounds: the
+// len is 0 but the index is 0"): flat/non-hierarchical chunks (SP5's
+// `lodTree: false` manifest, and locally-dropped .ply files partitioned via
+// `partitionDroppedMonolithic`, whose per-chunk .spz re-encode has no field
+// for LOD hierarchy data even though its manifest optimistically claims
+// `lodTree: true`) never populate `extra.lodTree`, so the shared WASM lod
+// tree's `splats` Vec stays empty once this mesh becomes eligible for
+// traversal, and reading `splats[0]` panics.
+//
+// A single dummy "leaf" node is NOT sufficient -- `numSplats` on the JS side
+// is literally the count of individual output entries from that traversal,
+// so a lone child_count=0 node would report exactly 1 splat total, silently
+// under-rendering everything instead of crashing. This synthesizes a valid
+// one-level tree for the chunk instead: one root entry (this chunk's
+// bounding volume, child_count = count-1) plus one real leaf entry per
+// remaining splat (child_count=0, that splat's own position), matching the
+// exact 4-word-per-LodSplat format `set_lod_tree_data` parses. This is sized
+// to fit: LodSplat.child_count is a u16 (max 65535) and a page holds at most
+// 65536 splats, so "count-1" always fits.
+//
+// NOTE: the resulting root entry's `child_start` is chunk-relative (value 1,
+// meaning "the next slot in this same chunk") -- SplatPager.ts's
+// processFetched knows the real chunk index and patches it to the correct
+// absolute `(chunk << 16) | 1` address before this reaches the WASM lod
+// tree.
+//
+// Cross-chunk stitching (siblingChunks parameter): each chunk's synthesized
+// tree only ever covers that ONE chunk's own splats -- with no additional
+// connectivity, chunk 0's tree has no edge to chunk 1's tree, chunk 1's tree
+// has no edge to chunk 2's, etc. Since traverse_lod_trees/
+// dynamic_traverse_lod_trees (rust/spark-rs/src/lod_tree.rs) can only ever
+// output splats reachable by walking child_start/child_count pointers
+// starting from the mesh's single root page, a scene split into N chunks
+// with N disconnected trees means only the ONE chunk that happens to be
+// assigned the root page is ever discoverable, fetched further, or
+// rendered -- regardless of how many other chunks are separately fetched
+// and uploaded. This measured as "only one section of the scene is ever
+// visible, no matter where the camera moves" on a real 32-chunk conversion.
+//
+// The fix: when building chunk 0's tree specifically (the only chunk whose
+// tree is guaranteed to become the traversal root), append one extra
+// "sibling pointer" entry per OTHER chunk in the manifest, using that
+// chunk's own bounding box for sizing/positioning and pointing its
+// child_start at THAT chunk's own local root (which that chunk will
+// synthesize independently, the same way, once its own data streams in).
+// This turns N disconnected single-chunk trees into one star-shaped tree
+// chunk 0 can walk into every sibling. Existing traversal logic already
+// treats an as-yet-unfetched child chunk (chunk_to_page[chunk] ==
+// 0xFFFFFFFF) as "not resident yet" and reports it via the `chunks`/
+// `touched` output, which SparkRenderer.ts already feeds back into fetch
+// priority -- so this also gets progressive, distance-prioritized loading of
+// every other chunk for free: compute_pixel_scale scores each sibling
+// pointer by size/distance-from-camera, so nearer chunks get expanded (and
+// therefore fetched) before farther ones, without any separate scheduling
+// logic.
+function synthesizeFlatLodTreeIfMissing(
+  result: { extra: { lodTree?: Uint32Array } },
+  count: number,
+  getCenter: (index: number) => [number, number, number],
+  siblingChunks?: { chunkIndex: number; center: [number, number, number]; size: number }[],
+) {
+  if (result.extra.lodTree || count <= 0) {
+    return;
+  }
+
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < count; i++) {
+    const [x, y, z] = getCenter(i);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const cz = (minZ + maxZ) / 2;
+  const diag = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+  const nominalSize = Math.max(diag / 2, 1e-4);
+
+  const writeEntry = (
+    lodTree: Uint32Array,
+    idx: number,
+    ex: number,
+    ey: number,
+    ez: number,
+    size: number,
+    childCount: number,
+    childStart: number,
+  ) => {
+    const o = idx * 4;
+    lodTree[o + 0] =
+      (float32ToHalfBits(ex) & 0xffff) |
+      ((float32ToHalfBits(ey) & 0xffff) << 16);
+    lodTree[o + 1] =
+      (float32ToHalfBits(ez) & 0xffff) |
+      ((float32ToHalfBits(size) & 0xffff) << 16);
+    lodTree[o + 2] = childCount & 0xffff;
+    lodTree[o + 3] = childStart >>> 0;
+  };
+
+  if (count <= 65536) {
+    const numSiblings = siblingChunks?.length ?? 0;
+    const totalEntries = count + numSiblings;
+    const lodTree = new Uint32Array(totalEntries * 4);
+    // Root's children are this chunk's own leaves (relative addr 1..count-1,
+    // patched to an absolute chunk address by SplatPager.ts's processFetched)
+    // immediately followed by the sibling-pointer entries (written with their
+    // final absolute chunk address directly below, since they reference a
+    // DIFFERENT chunk than this one and SplatPager.ts's patch only rewrites
+    // the root's own child_start, not every entry).
+    writeEntry(lodTree, 0, cx, cy, cz, nominalSize, count - 1 + numSiblings, 1);
+    for (let i = 1; i < count; i++) {
+      const [x, y, z] = getCenter(i);
+      writeEntry(lodTree, i, x, y, z, nominalSize, 0, 0);
+    }
+    if (siblingChunks) {
+      for (let s = 0; s < siblingChunks.length; s++) {
+        const sib = siblingChunks[s];
+        const absoluteChildStart = ((sib.chunkIndex << 16) | 0) >>> 0;
+        writeEntry(
+          lodTree,
+          count + s,
+          sib.center[0],
+          sib.center[1],
+          sib.center[2],
+          sib.size,
+          1,
+          absoluteChildStart,
+        );
+      }
+      console.log(
+        `[lod-tree-update] stitched ${siblingChunks.length} sibling chunk pointer(s) into chunk 0's tree ` +
+          `(chunks: ${siblingChunks.map((s) => s.chunkIndex).join(', ')})`,
+      );
+    }
+    result.extra.lodTree = lodTree;
+    console.log(
+      `[lod-tree-update] synthesized flat lod tree for this chunk: ${count} entries ` +
+        `(1 root + ${count - 1} leaves), root center=(${cx.toFixed(3)}, ${cy.toFixed(3)}, ${cz.toFixed(3)})`,
+    );
+  } else {
+    // 2-level tree for count > 65536 to avoid u16 child_count overflow
+    const pageSize = 65535;
+    const numIntermediates = Math.ceil(count / pageSize);
+    const totalNodes = 1 + numIntermediates + count;
+    const lodTree = new Uint32Array(totalNodes * 4);
+
+    // Root (index 0) points to intermediate nodes
+    writeEntry(lodTree, 0, cx, cy, cz, nominalSize, numIntermediates, 1);
+
+    // Intermediate nodes
+    for (let j = 0; j < numIntermediates; j++) {
+      const startLeafIdx = j * pageSize;
+      const endLeafIdx = Math.min(startLeafIdx + pageSize, count);
+      const leafCount = endLeafIdx - startLeafIdx;
+
+      // Compute intermediate bounding box center
+      let iminX = Number.POSITIVE_INFINITY;
+      let iminY = Number.POSITIVE_INFINITY;
+      let iminZ = Number.POSITIVE_INFINITY;
+      let imaxX = Number.NEGATIVE_INFINITY;
+      let imaxY = Number.NEGATIVE_INFINITY;
+      let imaxZ = Number.NEGATIVE_INFINITY;
+      for (let i = startLeafIdx; i < endLeafIdx; i++) {
+        const [x, y, z] = getCenter(i);
+        if (x < iminX) iminX = x;
+        if (x > imaxX) imaxX = x;
+        if (y < iminY) iminY = y;
+        if (y > imaxY) imaxY = y;
+        if (z < iminZ) iminZ = z;
+        if (z > imaxZ) imaxZ = z;
+      }
+      const icx = (iminX + imaxX) / 2;
+      const icy = (iminY + imaxY) / 2;
+      const icz = (iminZ + imaxZ) / 2;
+      const idiag = Math.hypot(imaxX - iminX, imaxY - iminY, imaxZ - iminZ);
+      const isize = Math.max(idiag / 2, 1e-4);
+
+      // Intermediate node index is 1 + j
+      // Its child_start points to the leaves
+      writeEntry(lodTree, 1 + j, icx, icy, icz, isize, leafCount, 1 + numIntermediates + startLeafIdx);
+    }
+
+    // Leaf nodes
+    for (let i = 0; i < count; i++) {
+      const [x, y, z] = getCenter(i);
+      writeEntry(lodTree, 1 + numIntermediates + i, x, y, z, nominalSize, 0, 0);
+    }
+    result.extra.lodTree = lodTree;
+    console.log(
+      `[lod-tree-update] synthesized 2-level flat lod tree for monolithic mesh: ${totalNodes} entries ` +
+        `(${count} leaves across ${numIntermediates} intermediate nodes), root center=(${cx.toFixed(3)}, ${cy.toFixed(3)}, ${cz.toFixed(3)})`,
+    );
+  }
+}
+
+function halfToFloat(binary: number) {
+  const exponent = (binary & 0x7c00) >> 10;
+  const fraction = binary & 0x03ff;
+  if (exponent === 0) {
+    return (binary & 0x8000 ? -1 : 1) * Math.pow(2, -14) * (fraction / 1024);
+  } else if (exponent === 0x1f) {
+    return fraction
+      ? Number.NaN
+      : binary & 0x8000
+        ? Number.NEGATIVE_INFINITY
+        : Number.POSITIVE_INFINITY;
+  }
+  return (
+    (binary & 0x8000 ? -1 : 1) *
+    Math.pow(2, exponent - 15) *
+    (1 + fraction / 1024)
+  );
+}
+
+// Minimal float32 -> IEEE754 half-float bit pattern conversion, used only to
+// build the synthetic lod tree data above (foveation/pixel-scale heuristics,
+// not final render precision).
+function float32ToHalfBits(val: number): number {
+  const f32 = new Float32Array([val]);
+  const u32 = new Uint32Array(f32.buffer)[0];
+  const sign = (u32 >> 31) & 0x1;
+  const exp = (u32 >> 23) & 0xff;
+  let mantissa = u32 & 0x7fffff;
+
+  if (exp === 0xff) {
+    return (sign << 15) | 0x7c00 | (mantissa ? 1 : 0);
+  }
+  const halfExp = exp - 127 + 15;
+  if (halfExp >= 0x1f) {
+    return (sign << 15) | 0x7bff;
+  }
+  if (halfExp <= 0) {
+    if (halfExp < -10) return sign << 15;
+    mantissa = (mantissa | 0x800000) >> (1 - halfExp);
+    return (sign << 15) | (mantissa >> 13);
+  }
+  return (sign << 15) | (halfExp << 10) | (mantissa >> 13);
 }
 
 async function initialize() {
