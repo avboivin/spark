@@ -11360,7 +11360,7 @@ class ZipChunkSource {
     if (!file) {
       throw new Error(`File ${cleanName} not found in zip`);
     }
-    return file;
+    return file.slice();
   }
 }
 const PAGE_WIDTH = 256;
