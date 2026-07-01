@@ -186,6 +186,26 @@ async function main() {
     const mlpSh = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_sh));
     const mlpOpacity = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_opacity));
 
+    let mlpOffsetW0 = new Float32Array(0);
+    let mlpOffsetB0 = new Float32Array(0);
+    let mlpOffsetW1 = new Float32Array(0);
+    let mlpOffsetB1 = new Float32Array(0);
+    let mlpOffsetW2 = new Float32Array(0);
+    let mlpOffsetB2 = new Float32Array(0);
+    let mlpOffsetW3 = new Float32Array(0);
+    let mlpOffsetB3 = new Float32Array(0);
+
+    if (chunkMeta.mlp_offset && Object.keys(chunkMeta.mlp_offset).length > 0) {
+      mlpOffsetW0 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["main.0.weight"]));
+      mlpOffsetB0 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["main.0.bias"]));
+      mlpOffsetW1 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["main.2.weight"]));
+      mlpOffsetB1 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["main.2.bias"]));
+      mlpOffsetW2 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["main.4.weight"]));
+      mlpOffsetB2 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["main.4.bias"]));
+      mlpOffsetW3 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["shs_output.0.weight"]));
+      mlpOffsetB3 = float16ArrayToFloat32Array(getBinaryPart(chunkMeta.mlp_offset["shs_output.0.bias"]));
+    }
+
     // Call the Rust WASM decoder!
     console.log("  Invoking reconstruct_sp5_chunk in Rust WASM...");
     const reconstructed = reconstruct_sp5_chunk(
@@ -200,10 +220,14 @@ async function main() {
       mlpDc,
       mlpSh,
       mlpOpacity,
-      new Float32Array(0), new Float32Array(0),
-      new Float32Array(0), new Float32Array(0),
-      new Float32Array(0), new Float32Array(0),
-      new Float32Array(0), new Float32Array(0)
+      mlpOffsetW0,
+      mlpOffsetB0,
+      mlpOffsetW1,
+      mlpOffsetB1,
+      mlpOffsetW2,
+      mlpOffsetB2,
+      mlpOffsetW3,
+      mlpOffsetB3
     );
 
     console.log(`  Decoded chunk successfully: count=${reconstructed.len()}, maxShDegree=${reconstructed.maxShDegree}`);
