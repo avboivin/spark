@@ -423,9 +423,9 @@
       progressBarFill.style.width = "0%";
 
       try {
-        const fileType = getSplatFileType(selectedFile.name);
         const arrayBuffer = await selectedFile.arrayBuffer();
         const fileBytes = new Uint8Array(arrayBuffer);
+        const fileType = getSplatFileType(fileBytes);
 
         const activeWorker = await getWorker();
 
