@@ -12346,6 +12346,7 @@ const _SplatPager = class _SplatPager {
         numSplats,
         lodTree: extra.lodTree
       });
+      console.log("processFetched: data =", data, "this.extSplats =", this.extSplats);
       if (isExtResult(data, this.extSplats)) {
         const extArrays = data.extArrays;
         const packedArray = extArrays[0];

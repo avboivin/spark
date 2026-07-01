@@ -1442,6 +1442,7 @@ export class SplatPager {
         lodTree: extra.lodTree as Uint32Array,
       });
 
+      console.log("processFetched: data =", data, "this.extSplats =", this.extSplats);
       if (isExtResult(data, this.extSplats)) {
         const extArrays = data.extArrays;
         const packedArray = extArrays[0];
