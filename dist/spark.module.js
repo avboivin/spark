@@ -12351,7 +12351,10 @@ const _SplatPager = class _SplatPager {
           data.extra.sh3a,
           data.extra.sh3b
         ];
-        shArrays.length = shArrays.findIndex((sh) => !sh);
+        const shLength = shArrays.findIndex((sh) => !sh);
+        if (shLength !== -1) {
+          shArrays.length = shLength;
+        }
         this.newUploads.push({
           page,
           numSplats,
@@ -12366,7 +12369,10 @@ const _SplatPager = class _SplatPager {
           data.extra.sh2,
           data.extra.sh3
         ];
-        shArrays.length = shArrays.findIndex((sh) => !sh);
+        const shLength = shArrays.findIndex((sh) => !sh);
+        if (shLength !== -1) {
+          shArrays.length = shLength;
+        }
         this.newUploads.push({
           page,
           numSplats,
