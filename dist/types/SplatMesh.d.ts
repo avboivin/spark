@@ -49,6 +49,7 @@ export type SplatMeshOptions = {
     coneFov?: number;
     coneFoveate?: number;
     paged?: boolean | PagedSplats | SplatPager;
+    pager?: SplatPager;
 };
 export type SplatMeshContext = {
     transform: SplatTransformer;

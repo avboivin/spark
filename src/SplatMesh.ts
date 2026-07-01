@@ -148,6 +148,7 @@ export type SplatMeshOptions = {
   // (default: 1.0)
   coneFoveate?: number;
   paged?: boolean | PagedSplats | SplatPager;
+  pager?: SplatPager;
 };
 
 export type SplatMeshContext = {
@@ -330,13 +331,12 @@ export class SplatMesh extends SplatGenerator {
         fileBytes: options.fileBytes ? new Uint8Array(options.fileBytes) : undefined,
         fileBlob: options.fileBlob,
         fileType: options.fileType,
+        pager: options.pager ?? (options.paged instanceof SplatPager ? options.paged : undefined),
       };
-      if (options.paged === true) {
+      if (options.paged === true || options.paged instanceof SplatPager) {
         this.paged = new PagedSplats(pagedOptions);
       } else if (options.paged instanceof PagedSplats) {
         this.paged = options.paged;
-      } else if (options.paged instanceof SplatPager) {
-        this.paged = new PagedSplats({ ...pagedOptions, pager: options.paged });
       } else {
         throw new Error("Invalid paged option");
       }
