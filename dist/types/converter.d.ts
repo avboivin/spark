@@ -1,4 +1,4 @@
-export declare function convertSplatToSp5Client({ numSplats, xyz, opacity, rgb, scales, quaternions, sh1, maxSh, onProgress, }: {
+export declare function convertSplatToSp5Client({ numSplats, xyz, opacity, rgb, scales, quaternions, sh1, maxSh, onProgress, priorityPoint, }: {
     numSplats: number;
     xyz: Float32Array;
     opacity: Float32Array;
@@ -8,4 +8,5 @@ export declare function convertSplatToSp5Client({ numSplats, xyz, opacity, rgb, 
     sh1?: Float32Array;
     maxSh: number;
     onProgress?: (phase: string, percent: number) => void;
+    priorityPoint?: [number, number, number];
 }): Promise<Uint8Array>;

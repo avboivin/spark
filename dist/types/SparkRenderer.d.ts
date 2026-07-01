@@ -521,6 +521,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     private pageSizeWarning;
     private updateLodInstances;
     private cleanupLodTrees;
+    private lastLoggedNumSplats;
     private updateLodIndices;
     private readbackDepth;
     private saveRenderState;

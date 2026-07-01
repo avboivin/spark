@@ -52,6 +52,7 @@ export declare class PagedSplats implements SplatSource {
         meta: RadMeta;
         chunksStart: number;
     }>;
+    cachedMeta?: RadMeta;
     dynoNumSplats: dyno.DynoInt<"numSplats">;
     dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
     rgbMinMaxLnScaleMinMax: dyno.DynoVec4<THREE.Vector4, "rgbMinMaxLnScaleMinMax">;
