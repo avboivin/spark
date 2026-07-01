@@ -12113,6 +12113,7 @@ const _SplatPager = class _SplatPager {
   }
   uploadPage(page, packedArray, shArrays, extArray) {
     const pageBase = page * PAGE_SPLATS;
+    console.log(`uploadPage: page=${page}, pageBase=${pageBase}, packedArray.length=${packedArray.length}, numShArrays=${shArrays.length}`);
     uploadTextureLayer(this.packedTexture, page, pageBase * 4, packedArray);
     if (extArray) {
       uploadTextureLayer(this.extTexture, page, pageBase * 4, extArray);

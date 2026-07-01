@@ -1147,6 +1147,7 @@ export class SplatPager {
     extArray?: Uint32Array,
   ) {
     const pageBase = page * PAGE_SPLATS;
+    console.log(`uploadPage: page=${page}, pageBase=${pageBase}, packedArray.length=${packedArray.length}, numShArrays=${shArrays.length}`);
 
     uploadTextureLayer(this.packedTexture, page, pageBase * 4, packedArray);
 
