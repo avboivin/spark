@@ -381,26 +381,12 @@ export class PagedSplats implements SplatSource {
       if (!this.pager) {
         throw new Error("PagedSplats.pager not set");
       }
-      let lodSplats: PackedResult | ExtResult;
+      let lodSplats: PackedResult | ExtResult = null as any;
       if (this.fileType === SplatFileType.SP5) {
         const result = (await worker.call("decodeSp5Chunk", {
           chunkBytes: decodeBytes!.slice(),
         })) as PackedResult;
         lodSplats = result;
-        if (!this.splatEncoding) {
-          this.splatEncoding = DEFAULT_SPLAT_ENCODING;
-          this.numSh =
-            lodSplats.extra.sh3
-              ? 3
-              : lodSplats.extra.sh2
-                ? 2
-                : lodSplats.extra.sh1
-                  ? 1
-                  : 0;
-        }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
       } else if (!this.pager.extSplats) {
         const result = (await worker.call("loadPackedSplats", {
           fileBytes: decodeBytes!.slice(),
@@ -410,14 +396,18 @@ export class PagedSplats implements SplatSource {
           sh3Codes: this.sh3Codes?.slice(),
         })) as { lodSplats: PackedResult };
         lodSplats = result.lodSplats;
-        if (!this.splatEncoding) {
-          this.splatEncoding = lodSplats.splatEncoding;
+      }
 
-          this.numSh = lodSplats.extra.sh3
+      if (this.fileType === SplatFileType.SP5 || !this.pager.extSplats) {
+        const packed = lodSplats as PackedResult;
+        if (!this.splatEncoding) {
+          this.splatEncoding = packed.splatEncoding || DEFAULT_SPLAT_ENCODING;
+
+          this.numSh = packed.extra.sh3
             ? 3
-            : lodSplats.extra.sh2
+            : packed.extra.sh2
               ? 2
-              : lodSplats.extra.sh1
+              : packed.extra.sh1
                 ? 1
                 : 0;
 
@@ -436,9 +426,9 @@ export class PagedSplats implements SplatSource {
             this.splatEncoding.sh3Max ?? 1.0,
           );
         }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
+        this.sh1Codes = packed.extra.sh1Codes ?? this.sh1Codes;
+        this.sh2Codes = packed.extra.sh2Codes ?? this.sh2Codes;
+        this.sh3Codes = packed.extra.sh3Codes ?? this.sh3Codes;
       } else {
         const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
         const result = (await worker.call("loadExtSplats", {

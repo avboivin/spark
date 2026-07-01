@@ -11604,19 +11604,12 @@ class PagedSplats {
       if (!this.pager) {
         throw new Error("PagedSplats.pager not set");
       }
-      let lodSplats;
+      let lodSplats = null;
       if (this.fileType === SplatFileType.SP5) {
         const result = await worker.call("decodeSp5Chunk", {
           chunkBytes: decodeBytes.slice()
         });
         lodSplats = result;
-        if (!this.splatEncoding) {
-          this.splatEncoding = DEFAULT_SPLAT_ENCODING;
-          this.numSh = lodSplats.extra.sh3 ? 3 : lodSplats.extra.sh2 ? 2 : lodSplats.extra.sh1 ? 1 : 0;
-        }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
       } else if (!this.pager.extSplats) {
         const result = await worker.call("loadPackedSplats", {
           fileBytes: decodeBytes.slice(),
@@ -11626,9 +11619,12 @@ class PagedSplats {
           sh3Codes: (_c = this.sh3Codes) == null ? void 0 : _c.slice()
         });
         lodSplats = result.lodSplats;
+      }
+      if (this.fileType === SplatFileType.SP5 || !this.pager.extSplats) {
+        const packed = lodSplats;
         if (!this.splatEncoding) {
-          this.splatEncoding = lodSplats.splatEncoding;
-          this.numSh = lodSplats.extra.sh3 ? 3 : lodSplats.extra.sh2 ? 2 : lodSplats.extra.sh1 ? 1 : 0;
+          this.splatEncoding = packed.splatEncoding || DEFAULT_SPLAT_ENCODING;
+          this.numSh = packed.extra.sh3 ? 3 : packed.extra.sh2 ? 2 : packed.extra.sh1 ? 1 : 0;
           this.rgbMinMaxLnScaleMinMax.value.set(
             this.splatEncoding.rgbMin ?? 0,
             this.splatEncoding.rgbMax ?? 1,
@@ -11642,9 +11638,9 @@ class PagedSplats {
             this.splatEncoding.sh3Max ?? 1
           );
         }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
+        this.sh1Codes = packed.extra.sh1Codes ?? this.sh1Codes;
+        this.sh2Codes = packed.extra.sh2Codes ?? this.sh2Codes;
+        this.sh3Codes = packed.extra.sh3Codes ?? this.sh3Codes;
       } else {
         const sh3Codes = this.sh3Codes;
         const result = await worker.call("loadExtSplats", {
