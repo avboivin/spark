@@ -11417,10 +11417,16 @@ class PagedSplats {
       const name = this.fileBlob.name;
       if (name) {
         this.fileType = getSplatFileTypeFromPath(name);
+        if (!this.fileType && name.toLowerCase().endsWith(".zip")) {
+          this.fileType = SplatFileType.SP5;
+        }
       }
     }
     if (!this.fileType && this.rootUrl) {
       this.fileType = getSplatFileTypeFromPath(this.rootUrl);
+      if (!this.fileType && this.rootUrl.toLowerCase().endsWith(".zip")) {
+        this.fileType = SplatFileType.SP5;
+      }
     }
     if (!this.fileType) {
       throw new Error("Unable to determine file type");
