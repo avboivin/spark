@@ -115,6 +115,7 @@ export declare function tryPcSogsZip(input: ArrayBuffer | Uint8Array): {
     name: string;
     json: PcSogsJson | PcSogsV2Json;
 } | undefined;
+export declare function trySp5Zip(input: ArrayBuffer | Uint8Array): boolean;
 export declare class SplatData {
     numSplats: number;
     maxSplats: number;

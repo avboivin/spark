@@ -38,9 +38,9 @@ const rpcHandlers = {
   updateLodTrees,
   traverseLodTrees,
   getLodTreeLevel,
-  nextChunk,
   partitionDroppedMonolithic,
   decodeSp5Chunk,
+  convertSplatToSp5,
 };
 
 async function onMessage(event: MessageEvent) {
@@ -987,80 +987,128 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
 
   const binaryPayload = chunkBytes.subarray(8 + jsonSize);
 
-  const gpccBytes = binaryPayload.subarray(
-    manifest.gpcc_offset,
-    manifest.gpcc_offset + manifest.gpcc_size,
-  );
+  let count = manifest.count;
+  const xyzRawFloat = new Float32Array(count * 3);
 
-  await ensureTmc3Loaded();
-  const fileSystem = tmc3Module.FS;
-  const mainFunc = tmc3Module.callMain;
+  if (manifest.is_uncompressed) {
+    const xyzBytes = binaryPayload.subarray(
+      manifest.xyz_uncompressed.offset,
+      manifest.xyz_uncompressed.offset + manifest.xyz_uncompressed.length,
+    );
+    // Convert float16 to float32
+    const u16 = new Uint16Array(
+      xyzBytes.buffer,
+      xyzBytes.byteOffset,
+      xyzBytes.byteLength / 2,
+    );
+    for (let i = 0; i < u16.length; i++) {
+      xyzRawFloat[i] = halfToFloat(u16[i]);
+    }
+  } else {
+    const gpccBytes = binaryPayload.subarray(
+      manifest.gpcc_offset,
+      manifest.gpcc_offset + manifest.gpcc_size,
+    );
 
-  const headView = new DataView(gpccBytes.buffer, gpccBytes.byteOffset, 24);
-  const meansMin = [
-    headView.getFloat32(0, true),
-    headView.getFloat32(4, true),
-    headView.getFloat32(8, true),
-  ];
-  const meansMax = [
-    headView.getFloat32(12, true),
-    headView.getFloat32(16, true),
-    headView.getFloat32(20, true),
-  ];
+    await ensureTmc3Loaded();
+    const fileSystem = tmc3Module.FS;
+    const mainFunc = tmc3Module.callMain;
 
-  const gpccStreamBytes = gpccBytes.subarray(24);
-  fileSystem.writeFile("/xyz.bin", gpccStreamBytes);
+    const headView = new DataView(gpccBytes.buffer, gpccBytes.byteOffset, 24);
+    const meansMin = [
+      headView.getFloat32(0, true),
+      headView.getFloat32(4, true),
+      headView.getFloat32(8, true),
+    ];
+    const meansMax = [
+      headView.getFloat32(12, true),
+      headView.getFloat32(16, true),
+      headView.getFloat32(20, true),
+    ];
 
-  try {
-    mainFunc([
-      "--mode=1",
-      "--compressedStreamPath=/xyz.bin",
-      "--reconstructedDataPath=/xyz.ply",
-    ]);
-  } catch (err: any) {
-    if (err !== 0 && err.status !== 0 && err.name !== "ExitStatus") {
-      throw new Error("TMC3 failed to decode: " + err);
+    const gpccStreamBytes = gpccBytes.subarray(24);
+    fileSystem.writeFile("/xyz.bin", gpccStreamBytes);
+
+    try {
+      mainFunc([
+        "--mode=1",
+        "--compressedStreamPath=/xyz.bin",
+        "--reconstructedDataPath=/xyz.ply",
+      ]);
+    } catch (err: any) {
+      if (err !== 0 && err.status !== 0 && err.name !== "ExitStatus") {
+        throw new Error("TMC3 failed to decode: " + err);
+      }
+    }
+
+    let plyBytes: Uint8Array;
+    try {
+      plyBytes = fileSystem.readFile("/xyz.ply");
+    } finally {
+      try {
+        fileSystem.unlink("/xyz.bin");
+      } catch (e) {}
+      try {
+        fileSystem.unlink("/xyz.ply");
+      } catch (e) {}
+    }
+
+    const headerText = new TextDecoder().decode(plyBytes.subarray(0, 2000));
+    const match = headerText.match(/end_header\r?\n/);
+    if (!match) throw new Error("Could not find end_header in PLY");
+    const headerEnd = match.index! + match[0].length;
+
+    const countMatch = headerText
+      .substring(0, headerEnd)
+      .match(/element vertex (\d+)/);
+    count = countMatch ? parseInt(countMatch[1]) : 0;
+
+    const isUint16 =
+      headerText.includes("property uint16") ||
+      headerText.includes("property ushort");
+    const isInt32 =
+      headerText.includes("property int32") ||
+      headerText.match(/property int\s+x/);
+    const isFloat64 =
+      headerText.includes("property float64") ||
+      headerText.includes("property double");
+    const bytesPerVertex = isFloat64 ? 24 : isUint16 ? 6 : 12;
+
+    const plyView = new DataView(
+      plyBytes.buffer,
+      plyBytes.byteOffset + headerEnd,
+    );
+
+    for (let i = 0; i < count; i++) {
+      let x, y, z;
+      if (isFloat64) {
+        x = plyView.getFloat64(i * bytesPerVertex + 0, true);
+        y = plyView.getFloat64(i * bytesPerVertex + 8, true);
+        z = plyView.getFloat64(i * bytesPerVertex + 16, true);
+      } else if (isInt32) {
+        x = plyView.getInt32(i * bytesPerVertex + 0, true);
+        y = plyView.getInt32(i * bytesPerVertex + 4, true);
+        z = plyView.getInt32(i * bytesPerVertex + 8, true);
+      } else if (isUint16) {
+        x = plyView.getUint16(i * bytesPerVertex + 0, true);
+        y = plyView.getUint16(i * bytesPerVertex + 2, true);
+        z = plyView.getUint16(i * bytesPerVertex + 4, true);
+      } else {
+        x = plyView.getFloat32(i * bytesPerVertex + 0, true);
+        y = plyView.getFloat32(i * bytesPerVertex + 4, true);
+        z = plyView.getFloat32(i * bytesPerVertex + 8, true);
+      }
+
+      // Scale and shift coordinates by meansMin / meansMax back to original bbox
+      const normX = x / 65535.0;
+      const normY = y / 65535.0;
+      const normZ = z / 65535.0;
+
+      xyzRawFloat[i * 3 + 0] = normX * (meansMax[0] - meansMin[0]) + meansMin[0];
+      xyzRawFloat[i * 3 + 1] = normY * (meansMax[1] - meansMin[1]) + meansMin[1];
+      xyzRawFloat[i * 3 + 2] = normZ * (meansMax[2] - meansMin[2]) + meansMin[2];
     }
   }
-
-  let plyBytes: Uint8Array;
-  try {
-    plyBytes = fileSystem.readFile("/xyz.ply");
-  } finally {
-    try {
-      fileSystem.unlink("/xyz.bin");
-    } catch (e) {}
-    try {
-      fileSystem.unlink("/xyz.ply");
-    } catch (e) {}
-  }
-
-  const headerText = new TextDecoder().decode(plyBytes.subarray(0, 2000));
-  const match = headerText.match(/end_header\r?\n/);
-  if (!match) throw new Error("Could not find end_header in PLY");
-  const headerEnd = match.index! + match[0].length;
-
-  const countMatch = headerText
-    .substring(0, headerEnd)
-    .match(/element vertex (\d+)/);
-  const count = countMatch ? parseInt(countMatch[1]) : 0;
-
-  const isUint16 =
-    headerText.includes("property uint16") ||
-    headerText.includes("property ushort");
-  const isInt32 =
-    headerText.includes("property int32") ||
-    headerText.match(/property int\s+x/);
-  const isFloat64 =
-    headerText.includes("property float64") ||
-    headerText.includes("property double");
-  const bytesPerVertex = isFloat64 ? 24 : isUint16 ? 6 : 12;
-
-  const xyzRawFloat = new Float32Array(count * 3);
-  const plyView = new DataView(
-    plyBytes.buffer,
-    plyBytes.byteOffset + headerEnd,
-  );
 
   function halfToFloat(binary: number) {
     const exponent = (binary & 0x7c00) >> 10;
@@ -1077,36 +1125,6 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
       Math.pow(2, exponent - 15) *
       (1 + fraction / 1024)
     );
-  }
-
-  for (let i = 0; i < count; i++) {
-    let x, y, z;
-    if (isFloat64) {
-      x = plyView.getFloat64(i * bytesPerVertex + 0, true);
-      y = plyView.getFloat64(i * bytesPerVertex + 8, true);
-      z = plyView.getFloat64(i * bytesPerVertex + 16, true);
-    } else if (isInt32) {
-      x = plyView.getInt32(i * bytesPerVertex + 0, true);
-      y = plyView.getInt32(i * bytesPerVertex + 4, true);
-      z = plyView.getInt32(i * bytesPerVertex + 8, true);
-    } else if (isUint16) {
-      x = plyView.getUint16(i * bytesPerVertex + 0, true);
-      y = plyView.getUint16(i * bytesPerVertex + 2, true);
-      z = plyView.getUint16(i * bytesPerVertex + 4, true);
-    } else {
-      x = plyView.getFloat32(i * bytesPerVertex + 0, true);
-      y = plyView.getFloat32(i * bytesPerVertex + 4, true);
-      z = plyView.getFloat32(i * bytesPerVertex + 8, true);
-    }
-
-    // Scale and shift coordinates by meansMin / meansMax back to original bbox
-    const normX = x / 65535.0;
-    const normY = y / 65535.0;
-    const normZ = z / 65535.0;
-
-    xyzRawFloat[i * 3 + 0] = normX * (meansMax[0] - meansMin[0]) + meansMin[0];
-    xyzRawFloat[i * 3 + 1] = normY * (meansMax[1] - meansMin[1]) + meansMin[1];
-    xyzRawFloat[i * 3 + 2] = normZ * (meansMax[2] - meansMin[2]) + meansMin[2];
   }
 
   function decodeHuffman(
@@ -1295,6 +1313,64 @@ async function initialize() {
     onMessage(event);
   }
   pending.length = 0;
+}
+
+import { convertSplatToSp5Client } from "./converter";
+
+async function convertSplatToSp5(
+  {
+    fileBytes,
+    fileType,
+    pathName,
+  }: {
+    fileBytes: Uint8Array;
+    fileType?: string;
+    pathName?: string;
+  },
+  {
+    sendStatus,
+  }: {
+    sendStatus: (data: unknown) => void;
+  },
+) {
+  sendStatus({ phase: "Parsing input splat...", percent: 5 });
+  const decoder = decode_to_gsplatarray(fileType, pathName);
+  const decoded = (await decodeBytesUrl({
+    decoder,
+    fileBytes,
+    sendStatus,
+  })) as any;
+
+  sendStatus({ phase: "Extracting splat attributes...", percent: 15 });
+  const attrs = decoded.extract_attributes();
+
+  const numSplats = attrs.num_splats;
+  const maxSh = attrs.max_sh;
+
+  const xyz = new Float32Array(attrs.xyz);
+  const opacity = new Float32Array(attrs.opacity);
+  const rgb = new Float32Array(attrs.rgb);
+  const scales = new Float32Array(attrs.scales);
+  const quaternions = new Float32Array(attrs.quaternions);
+  const sh1 = maxSh > 0 ? new Float32Array(attrs.sh1) : undefined;
+
+  decoded.free();
+
+  const zipBytes = await convertSplatToSp5Client({
+    numSplats,
+    xyz,
+    opacity,
+    rgb,
+    scales,
+    quaternions,
+    sh1,
+    maxSh,
+    onProgress: (phase, percent) => {
+      sendStatus({ phase, percent });
+    },
+  });
+
+  return zipBytes;
 }
 
 initialize().catch(console.error);

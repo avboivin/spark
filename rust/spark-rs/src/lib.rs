@@ -4,7 +4,7 @@ use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, Uint16Array, Uint
 use spark_lib::decoder::{ChunkReceiver, MultiDecoder, SplatEncoding, SplatFileType, SplatGetter};
 use spark_lib::gsplat::GsplatArray as GsplatArrayInner;
 use spark_lib::csplat::CsplatArray as CsplatArrayInner;
-use spark_lib::tsplat::TsplatArray;
+use spark_lib::tsplat::{TsplatArray, Tsplat};
 use wasm_bindgen::prelude::*;
 
 use crate::ext_splats::ExtSplatsData;
@@ -267,6 +267,81 @@ impl GsplatArray {
         let bytes = encoder.encode().map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Uint8Array::from(bytes.as_slice()))
     }
+
+    pub fn extract_attributes(&self) -> ExtractedAttributes {
+        let num_points = self.inner.len();
+        let mut xyz = Vec::with_capacity(num_points * 3);
+        let mut opacity = Vec::with_capacity(num_points);
+        let mut rgb = Vec::with_capacity(num_points * 3);
+        let mut scales = Vec::with_capacity(num_points * 3);
+        let mut quaternions = Vec::with_capacity(num_points * 4);
+        let mut sh1 = Vec::with_capacity(num_points * 9);
+
+        for i in 0..num_points {
+            let splat = self.inner.get(i);
+            let c = splat.center();
+            xyz.push(c[0]); xyz.push(c[1]); xyz.push(c[2]);
+
+            opacity.push(splat.opacity());
+
+            let color = splat.rgb();
+            rgb.push(color[0]); rgb.push(color[1]); rgb.push(color[2]);
+
+            let s = splat.scales();
+            scales.push(s[0]); scales.push(s[1]); scales.push(s[2]);
+
+            let q = splat.quaternion().to_array();
+            quaternions.push(q[0]); quaternions.push(q[1]); quaternions.push(q[2]); quaternions.push(q[3]);
+
+            if self.inner.max_sh_degree > 0 && i < self.inner.sh1.len() {
+                let sh = self.inner.sh1[i].0;
+                for row in 0..3 {
+                    for col in 0..3 {
+                        sh1.push(sh[row][col].to_f32());
+                    }
+                }
+            }
+        }
+
+        ExtractedAttributes {
+            num_splats: num_points,
+            max_sh: self.inner.max_sh_degree,
+            xyz,
+            opacity,
+            rgb,
+            scales,
+            quaternions,
+            sh1,
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub struct ExtractedAttributes {
+    pub num_splats: usize,
+    pub max_sh: usize,
+    xyz: Vec<f32>,
+    opacity: Vec<f32>,
+    rgb: Vec<f32>,
+    scales: Vec<f32>,
+    quaternions: Vec<f32>,
+    sh1: Vec<f32>,
+}
+
+#[wasm_bindgen]
+impl ExtractedAttributes {
+    #[wasm_bindgen(getter)]
+    pub fn xyz(&self) -> Vec<f32> { self.xyz.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn opacity(&self) -> Vec<f32> { self.opacity.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn rgb(&self) -> Vec<f32> { self.rgb.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn scales(&self) -> Vec<f32> { self.scales.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn quaternions(&self) -> Vec<f32> { self.quaternions.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn sh1(&self) -> Vec<f32> { self.sh1.clone() }
 }
 
 #[wasm_bindgen]
@@ -665,12 +740,6 @@ pub fn reconstruct_sp5_chunk(
         let py = points[idx][1];
         let pz = points[idx][2];
 
-        let uni = contract_to_unisphere(px, py, pz);
-        let mut encoded_xyz = [0.0f32; 96];
-        get_tcnn_frequency_encoding(uni, 16, &mut encoded_xyz);
-
-        let cont_feature = run_tcnn_mlp(&encoded_xyz, mlp_cont, 96, 64, 13, 1, Activation::ReLU);
-
         let s_idx0 = scale_indices[i] as usize;
         let s_idx1 = scale_indices[num_points + i] as usize;
         let s_idx2 = scale_indices[2 * num_points + i] as usize;
@@ -701,21 +770,42 @@ pub fn reconstruct_sp5_chunk(
             app_codebook[1024 + a_idx2 * 2 + 1],
         ];
 
-        let mut space_feature = [0.0f32; 16];
-        space_feature[0..13].copy_from_slice(&cont_feature);
-        space_feature[13] = app_val[0];
-        space_feature[14] = app_val[1];
-        space_feature[15] = app_val[2];
+        let opacity_raw;
+        let mut dc_raw;
+        let mut sh_raw;
+        if mlp_cont.is_empty() {
+            opacity_raw = vec![mlp_opacity[idx]];
+            dc_raw = vec![mlp_dc[idx * 3 + 0], mlp_dc[idx * 3 + 1], mlp_dc[idx * 3 + 2]];
+            sh_raw = vec![0.0f32; 9];
+            if !mlp_sh.is_empty() {
+                for k in 0..9 {
+                    sh_raw[k] = mlp_sh[idx * 9 + k];
+                }
+            }
+        } else {
+            let uni = contract_to_unisphere(px, py, pz);
+            let mut encoded_xyz = [0.0f32; 96];
+            get_tcnn_frequency_encoding(uni, 16, &mut encoded_xyz);
 
-        let mut view_feature = [0.0f32; 16];
-        view_feature[0..13].copy_from_slice(&cont_feature);
-        view_feature[13] = app_val[3];
-        view_feature[14] = app_val[4];
-        view_feature[15] = app_val[5];
+            let cont_feature = run_tcnn_mlp(&encoded_xyz, mlp_cont, 96, 64, 13, 1, Activation::ReLU);
 
-        let opacity_raw = run_tcnn_mlp(&space_feature, mlp_opacity, 16, 64, 1, 1, Activation::LeakyReLU);
-        let mut dc_raw = run_tcnn_mlp(&space_feature, mlp_dc, 16, 64, 3, 1, Activation::LeakyReLU);
-        let mut sh_raw = run_tcnn_mlp(&view_feature, mlp_sh, 16, 64, 9, 1, Activation::LeakyReLU);
+            let mut space_feature = [0.0f32; 16];
+            space_feature[0..13].copy_from_slice(&cont_feature);
+            space_feature[13] = app_val[0];
+            space_feature[14] = app_val[1];
+            space_feature[15] = app_val[2];
+
+            let mut view_feature = [0.0f32; 16];
+            view_feature[0..13].copy_from_slice(&cont_feature);
+            view_feature[13] = app_val[3];
+            view_feature[14] = app_val[4];
+            view_feature[15] = app_val[5];
+
+            let opacity_out = run_tcnn_mlp(&space_feature, mlp_opacity, 16, 64, 1, 1, Activation::LeakyReLU);
+            opacity_raw = opacity_out;
+            dc_raw = run_tcnn_mlp(&space_feature, mlp_dc, 16, 64, 3, 1, Activation::LeakyReLU);
+            sh_raw = run_tcnn_mlp(&view_feature, mlp_sh, 16, 64, 9, 1, Activation::LeakyReLU);
+        }
 
         let scale_exp = [scale_val[0].exp(), scale_val[1].exp(), scale_val[2].exp()];
         let scale_mag = (scale_exp[0]*scale_exp[0] + scale_exp[1]*scale_exp[1] + scale_exp[2]*scale_exp[2]).sqrt() + 1e-8;
@@ -724,42 +814,48 @@ pub fn reconstruct_sp5_chunk(
         let rot_mag = (rot_val[0]*rot_val[0] + rot_val[1]*rot_val[1] + rot_val[2]*rot_val[2] + rot_val[3]*rot_val[3]).sqrt() + 1e-8;
         let rot_norm = [rot_val[0] / rot_mag, rot_val[1] / rot_mag, rot_val[2] / rot_mag, rot_val[3] / rot_mag];
 
-        let mut shs_flat = [0.0f32; 12];
-        shs_flat[0..3].copy_from_slice(&dc_raw);
-        shs_flat[3..12].copy_from_slice(&sh_raw);
-        let mut shs_norm = [0.0f32; 12];
-        let shs_mag = shs_flat.iter().map(|&x| x * x).sum::<f32>().sqrt() + 1e-8;
-        for j in 0..12 {
-            shs_norm[j] = shs_flat[j] / shs_mag;
-        }
+        let opacity_val;
+        if mlp_cont.is_empty() {
+            opacity_val = opacity_raw[0];
+        } else {
+            let mut shs_flat = [0.0f32; 12];
+            shs_flat[0..3].copy_from_slice(&dc_raw);
+            shs_flat[3..12].copy_from_slice(&sh_raw);
+            let mut shs_norm = [0.0f32; 12];
+            let shs_mag = shs_flat.iter().map(|&x| x * x).sum::<f32>().sqrt() + 1e-8;
+            for j in 0..12 {
+                shs_norm[j] = shs_flat[j] / shs_mag;
+            }
 
-        let act_opacity = sigmoid(opacity_raw[0]);
-        let mut shsnn_input = [0.0f32; 23];
-        shsnn_input[0..12].copy_from_slice(&shs_norm);
-        shsnn_input[12] = act_opacity;
-        shsnn_input[13..16].copy_from_slice(&scale_norm);
-        shsnn_input[16] = px;
-        shsnn_input[17] = py;
-        shsnn_input[18] = pz;
-        shsnn_input[19..23].copy_from_slice(&rot_norm);
+            let act_opacity = sigmoid(opacity_raw[0]);
+            opacity_val = act_opacity;
+            let mut shsnn_input = [0.0f32; 23];
+            shsnn_input[0..12].copy_from_slice(&shs_norm);
+            shsnn_input[12] = act_opacity;
+            shsnn_input[13..16].copy_from_slice(&scale_norm);
+            shsnn_input[16] = px;
+            shsnn_input[17] = py;
+            shsnn_input[18] = pz;
+            shsnn_input[19..23].copy_from_slice(&rot_norm);
 
-        let feat1 = run_pytorch_mlp(&shsnn_input, mlp_offset_w0, mlp_offset_b0, true);
-        let feat2 = run_pytorch_mlp(&feat1, mlp_offset_w1, mlp_offset_b1, true);
-        let feat3 = run_pytorch_mlp(&feat2, mlp_offset_w2, mlp_offset_b2, true);
-        let sh_offset = run_pytorch_mlp(&feat3, mlp_offset_w3, mlp_offset_b3, false);
+            let feat1 = run_pytorch_mlp(&shsnn_input, mlp_offset_w0, mlp_offset_b0, true);
+            let feat2 = run_pytorch_mlp(&feat1, mlp_offset_w1, mlp_offset_b1, true);
+            let feat3 = run_pytorch_mlp(&feat2, mlp_offset_w2, mlp_offset_b2, true);
+            let sh_offset = run_pytorch_mlp(&feat3, mlp_offset_w3, mlp_offset_b3, false);
 
-        dc_raw[0] += sh_offset[0];
-        dc_raw[1] += sh_offset[1];
-        dc_raw[2] += sh_offset[2];
-        for r in 0..3 {
-            sh_raw[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
-            sh_raw[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
-            sh_raw[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
+            dc_raw[0] += sh_offset[0];
+            dc_raw[1] += sh_offset[1];
+            dc_raw[2] += sh_offset[2];
+            for r in 0..3 {
+                sh_raw[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
+                sh_raw[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
+                sh_raw[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
+            }
         }
 
         let gsplat = Gsplat {
             center: glam::Vec3::new(px, py, pz),
-            opacity: f16::from_f32(opacity_raw[0]),
+            opacity: f16::from_f32(opacity_val),
             rgb: [f16::from_f32(dc_raw[0]), f16::from_f32(dc_raw[1]), f16::from_f32(dc_raw[2])],
             ln_scales: [f16::from_f32(scale_val[0]), f16::from_f32(scale_val[1]), f16::from_f32(scale_val[2])],
             quaternion: [f16::from_f32(rot_val[0]), f16::from_f32(rot_val[1]), f16::from_f32(rot_val[2]), f16::from_f32(rot_val[3])],

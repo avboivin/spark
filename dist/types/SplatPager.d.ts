@@ -13,19 +13,24 @@ export interface PagedSplatsOptions {
     maxSh?: number;
 }
 export interface ChunkSource {
-    read(offset?: number, bytes?: number): Promise<Uint8Array>;
+    read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array>;
 }
 export declare class HttpChunkSource implements ChunkSource {
     private url;
     private requestHeader?;
     private withCredentials?;
     constructor(url: string, requestHeader?: Record<string, string> | undefined, withCredentials?: boolean | undefined);
-    read(offset?: number, bytes?: number): Promise<Uint8Array>;
+    read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array>;
 }
 export declare class BlobChunkSource implements ChunkSource {
     private blob;
     constructor(blob: Blob);
-    read(offset?: number, bytes?: number): Promise<Uint8Array>;
+    read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array>;
+}
+export declare class ZipChunkSource implements ChunkSource {
+    private files;
+    constructor(zipBytes: Uint8Array);
+    read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array>;
 }
 export declare class PagedSplats implements SplatSource {
     pager?: SplatPager;

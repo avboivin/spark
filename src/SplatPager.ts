@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { unzipSync } from "fflate";
 
 import { decode_rad_header } from "spark-rs";
 import { LN_SCALE_MAX, LN_SCALE_MIN, dyno } from ".";
@@ -37,7 +38,7 @@ export interface PagedSplatsOptions {
 }
 
 export interface ChunkSource {
-  read(offset?: number, bytes?: number): Promise<Uint8Array>;
+  read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array>;
 }
 
 export class HttpChunkSource implements ChunkSource {
@@ -46,7 +47,7 @@ export class HttpChunkSource implements ChunkSource {
     private requestHeader?: Record<string, string>,
     private withCredentials?: boolean
   ) {}
-  async read(offset?: number, bytes?: number): Promise<Uint8Array> {
+  async read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array> {
     return fetchRange({
       url: this.url,
       requestHeader: this.requestHeader,
@@ -59,11 +60,29 @@ export class HttpChunkSource implements ChunkSource {
 
 export class BlobChunkSource implements ChunkSource {
   constructor(private blob: Blob) {}
-  async read(offset?: number, bytes?: number): Promise<Uint8Array> {
+  async read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array> {
     const sliced = offset !== undefined && bytes !== undefined
       ? this.blob.slice(offset, offset + bytes)
       : this.blob;
     return new Uint8Array(await sliced.arrayBuffer());
+  }
+}
+
+export class ZipChunkSource implements ChunkSource {
+  private files: Record<string, Uint8Array> = {};
+  constructor(zipBytes: Uint8Array) {
+    this.files = unzipSync(zipBytes);
+  }
+  async read(offset?: number, bytes?: number, filename?: string): Promise<Uint8Array> {
+    if (!filename) {
+      throw new Error("ZipChunkSource requires a filename");
+    }
+    const cleanName = filename.split(/[\\/]/).pop() || filename;
+    const file = this.files[cleanName];
+    if (!file) {
+      throw new Error(`File ${cleanName} not found in zip`);
+    }
+    return file;
   }
 }
 
@@ -146,9 +165,17 @@ export class PagedSplats implements SplatSource {
     }
 
     if (this.fileBlob) {
-      this.chunkSource = new BlobChunkSource(this.fileBlob);
+      if (this.fileType === SplatFileType.SP5) {
+        this.chunkSource = null as any; // initialized asynchronously inside getRadMeta
+      } else {
+        this.chunkSource = new BlobChunkSource(this.fileBlob);
+      }
     } else if (this.fileBytes) {
-      this.chunkSource = new BlobChunkSource(new Blob([this.fileBytes]));
+      if (this.fileType === SplatFileType.SP5) {
+        this.chunkSource = new ZipChunkSource(this.fileBytes);
+      } else {
+        this.chunkSource = new BlobChunkSource(new Blob([this.fileBytes]));
+      }
     } else if (this.rootUrl) {
       this.chunkSource = new HttpChunkSource(
         this.rootUrl,
@@ -189,6 +216,24 @@ export class PagedSplats implements SplatSource {
 
     this.radMetaPromise = (async () => {
       await wasm.initialization;
+
+      if (this.fileType === SplatFileType.SP5) {
+        if (this.fileBlob && !this.chunkSource) {
+          const buffer = await this.fileBlob.arrayBuffer();
+          this.chunkSource = new ZipChunkSource(new Uint8Array(buffer));
+        }
+        if (this.chunkSource instanceof ZipChunkSource) {
+          const manifestBytes = await this.chunkSource.read(0, 0, "manifest.json");
+          const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
+          return { meta: manifest, chunksStart: 0 };
+        } else if (this.rootUrl) {
+          const resolvedRoot = new URL(this.rootUrl, window.location.href).toString();
+          const manifestUrl = resolvedRoot.endsWith(".json") ? resolvedRoot : new URL("manifest.json", resolvedRoot).toString();
+          const response = await fetch(manifestUrl);
+          const manifest = await response.json();
+          return { meta: manifest, chunksStart: 0 };
+        }
+      }
 
       if (!this.chunkSource) {
         throw new Error("No chunkSource available");
@@ -293,7 +338,14 @@ export class PagedSplats implements SplatSource {
       } else if (this.fileBytes) {
         // Fall through
       } else if (this.rootUrl) {
-        const url = this.chunkUrl(chunk);
+        let url = this.chunkUrl(chunk);
+        if (this.fileType === SplatFileType.SP5) {
+          const { meta } = await this.getRadMeta();
+          const filename = (meta.chunks[chunk] as any).file || `scene-lod-${chunk}.sp5`;
+          const resolvedRoot = new URL(this.rootUrl, window.location.href).toString();
+          const lastSlash = resolvedRoot.lastIndexOf("/");
+          url = resolvedRoot.slice(0, lastSlash + 1) + filename;
+        }
         const request = new Request(url, {
           headers: this.requestHeader
             ? new Headers(this.requestHeader)
@@ -307,6 +359,14 @@ export class PagedSplats implements SplatSource {
           );
         }
         decodeBytes = new Uint8Array(await response.arrayBuffer());
+      } else if (this.fileType === SplatFileType.SP5) {
+        const { meta } = await this.getRadMeta();
+        const filename = (meta.chunks[chunk] as any).file || `scene-lod-${chunk}.sp5`;
+        if (this.chunkSource) {
+          decodeBytes = await this.chunkSource.read(0, 0, filename);
+        } else {
+          throw new Error("No chunkSource available");
+        }
       } else if (this.chunkSource) {
         decodeBytes = await this.chunkSource.read();
       } else {

@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • .sp5 Converter</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Outfit:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-gradient: radial-gradient(circle at center, #1a151b 0%, #0d0a0d 100%);
+      --panel-bg: rgba(25, 18, 25, 0.45);
+      --border-color: rgba(255, 108, 108, 0.15);
+      --border-hover: rgba(255, 108, 108, 0.45);
+      --text-main: #f3f3f3;
+      --text-muted: #8e8a8e;
+      --accent-color: #ff6c6c;
+      --accent-gradient: linear-gradient(135deg, #ff6c6c 0%, #ff4b8e 100%);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', sans-serif;
+      background: var(--bg-gradient);
+      color: var(--text-main);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    .logo-container {
+      margin-bottom: 2rem;
+      text-align: center;
+      animation: fadeIn 0.8s ease-out;
+    }
+
+    .logo-container h1 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 2.5rem;
+      font-weight: 800;
+      margin: 0;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.03em;
+    }
+
+    .logo-container p {
+      font-size: 1rem;
+      color: var(--text-muted);
+      margin: 0.5rem 0 0 0;
+      font-weight: 300;
+    }
+
+    .convert-card {
+      width: 90%;
+      max-width: 600px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border-color);
+      border-radius: 24px;
+      padding: 2.5rem;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+      animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      transition: border-color 0.3s ease;
+    }
+
+    .convert-card:hover {
+      border-color: var(--border-hover);
+    }
+
+    .drop-zone {
+      border: 2px dashed rgba(255, 108, 108, 0.3);
+      border-radius: 16px;
+      padding: 4rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+      background: rgba(255, 255, 255, 0.02);
+      margin-bottom: 1.5rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: var(--accent-color);
+      background: rgba(255, 108, 108, 0.05);
+      transform: translateY(-2px);
+    }
+
+    .drop-zone-icon {
+      font-size: 3rem;
+      margin-bottom: 1rem;
+      display: inline-block;
+      transition: transform 0.3s ease;
+    }
+
+    .drop-zone:hover .drop-zone-icon {
+      transform: scale(1.1);
+    }
+
+    .drop-zone-text {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--text-main);
+      margin-bottom: 0.5rem;
+    }
+
+    .drop-zone-subtext {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    .file-input {
+      display: none;
+    }
+
+    .file-info-badge {
+      display: none;
+      align-items: center;
+      gap: 0.75rem;
+      background: rgba(255, 108, 108, 0.1);
+      border: 1px solid rgba(255, 108, 108, 0.25);
+      padding: 0.75rem 1.25rem;
+      border-radius: 12px;
+      margin-bottom: 1.5rem;
+      animation: fadeIn 0.4s ease-out;
+    }
+
+    .file-info-badge.active {
+      display: flex;
+    }
+
+    .file-info-icon {
+      font-size: 1.25rem;
+    }
+
+    .file-info-details {
+      flex: 1;
+      font-size: 0.9rem;
+      text-align: left;
+    }
+
+    .file-info-name {
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .file-info-size {
+      color: var(--text-muted);
+      font-size: 0.8rem;
+    }
+
+    .options-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+
+    .option-field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .option-label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .option-select, .option-input {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      color: var(--text-main);
+      font-size: 0.95rem;
+      font-family: inherit;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+
+    .option-select:focus, .option-input:focus {
+      border-color: rgba(255, 108, 108, 0.5);
+      background: rgba(255, 255, 255, 0.08);
+      box-shadow: 0 0 0 3px rgba(255, 108, 108, 0.15);
+    }
+
+    .convert-btn {
+      width: 100%;
+      background: var(--accent-gradient);
+      color: #fff;
+      border: none;
+      border-radius: 12px;
+      padding: 1rem;
+      font-size: 1.05rem;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 10px 20px rgba(255, 108, 108, 0.2);
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .convert-btn:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 15px 25px rgba(255, 108, 108, 0.35);
+    }
+
+    .convert-btn:active:not(:disabled) {
+      transform: translateY(0);
+    }
+
+    .convert-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .progress-container {
+      display: none;
+      margin-top: 2rem;
+      animation: fadeIn 0.4s ease-out;
+    }
+
+    .progress-container.active {
+      display: block;
+    }
+
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.9rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .progress-status {
+      font-weight: 600;
+      color: var(--accent-color);
+    }
+
+    .progress-bar-bg {
+      width: 100%;
+      height: 8px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent-gradient);
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .back-link {
+      position: absolute;
+      top: 30px;
+      left: 30px;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: color 0.2s ease;
+    }
+
+    .back-link:hover {
+      color: var(--accent-color);
+    }
+  </style>
+</head>
+<body>
+  <a href="index.html" class="back-link">
+    <span>&larr;</span> Back to Viewer
+  </a>
+
+  <div class="logo-container">
+    <h1>Spark .sp5 Converter</h1>
+    <p>Neural splat compression pipeline in your browser</p>
+  </div>
+
+  <div class="convert-card">
+    <div class="drop-zone" id="drop-zone">
+      <span class="drop-zone-icon">📦</span>
+      <div class="drop-zone-text">Drag & Drop Splat File</div>
+      <div class="drop-zone-subtext">Supports .ply, .spz, .splat, or .ksplat</div>
+      <input type="file" class="file-input" id="file-input" accept=".ply,.spz,.splat,.ksplat" />
+    </div>
+
+    <div class="file-info-badge" id="file-badge">
+      <span class="file-info-icon">📄</span>
+      <div class="file-info-details">
+        <div class="file-info-name" id="file-name">-</div>
+        <div class="file-info-size" id="file-size">-</div>
+      </div>
+    </div>
+
+    <div class="options-grid">
+      <div class="option-field">
+        <label class="option-label">Compression Mode</label>
+        <select class="option-select" id="option-mode">
+          <option value="c1">(Recommended) SVQ-Only (Track C1)</option>
+        </select>
+      </div>
+    </div>
+
+    <button class="convert-btn" id="convert-btn" disabled>Convert Splat</button>
+
+    <div class="progress-container" id="progress-container">
+      <div class="progress-header">
+        <span class="progress-status" id="progress-status">Initializing...</span>
+        <span id="progress-percent">0%</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progress-bar-fill"></div>
+      </div>
+    </div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import { SplatWorker, getSplatFileType } from "@sparkjsdev/spark";
+
+    const dropZone = document.getElementById("drop-zone");
+    const fileInput = document.getElementById("file-input");
+    const fileBadge = document.getElementById("file-badge");
+    const fileNameEl = document.getElementById("file-name");
+    const fileSizeEl = document.getElementById("file-size");
+    const convertBtn = document.getElementById("convert-btn");
+    const progressContainer = document.getElementById("progress-container");
+    const progressStatus = document.getElementById("progress-status");
+    const progressPercent = document.getElementById("progress-percent");
+    const progressBarFill = document.getElementById("progress-bar-fill");
+
+    let selectedFile = null;
+    let worker = null;
+
+    // Initialize worker pool
+    async function getWorker() {
+      if (!worker) {
+        worker = new SplatWorker();
+      }
+      return worker;
+    }
+
+    dropZone.addEventListener("click", () => fileInput.click());
+
+    dropZone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      dropZone.classList.add("dragover");
+    });
+
+    ["dragleave", "drop"].forEach(name => {
+      dropZone.addEventListener(name, () => dropZone.classList.remove("dragover"));
+    });
+
+    dropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      if (e.dataTransfer.files.length > 0) {
+        selectFile(e.dataTransfer.files[0]);
+      }
+    });
+
+    fileInput.addEventListener("change", (e) => {
+      if (e.target.files.length > 0) {
+        selectFile(e.target.files[0]);
+      }
+    });
+
+    function selectFile(file) {
+      selectedFile = file;
+      fileNameEl.textContent = file.name;
+      fileSizeEl.textContent = (file.size / (1024 * 1024)).toFixed(2) + " MB";
+      fileBadge.classList.add("active");
+      convertBtn.disabled = false;
+
+      // Reset progress
+      progressContainer.classList.remove("active");
+      progressBarFill.style.width = "0%";
+      progressPercent.textContent = "0%";
+    }
+
+    convertBtn.addEventListener("click", async () => {
+      if (!selectedFile) return;
+
+      convertBtn.disabled = true;
+      progressContainer.classList.add("active");
+      progressStatus.textContent = "Spawning background compression worker...";
+      progressPercent.textContent = "0%";
+      progressBarFill.style.width = "0%";
+
+      try {
+        const fileType = getSplatFileType(selectedFile.name);
+        const arrayBuffer = await selectedFile.arrayBuffer();
+        const fileBytes = new Uint8Array(arrayBuffer);
+
+        const activeWorker = await getWorker();
+
+        const zipBytes = await activeWorker.call("convertSplatToSp5", {
+          fileBytes,
+          fileType,
+          pathName: selectedFile.name,
+        }, {
+          onStatus: (status) => {
+            if (status.phase) {
+              progressStatus.textContent = status.phase;
+            }
+            if (status.percent !== undefined) {
+              progressPercent.textContent = status.percent + "%";
+              progressBarFill.style.width = status.percent + "%";
+            }
+          }
+        });
+
+        progressStatus.textContent = "Export complete! Triggering download...";
+        progressPercent.textContent = "100%";
+        progressBarFill.style.width = "100%";
+
+        // Trigger zip download
+        const blob = new Blob([zipBytes], { type: "application/zip" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = selectedFile.name.split(".")[0] + "-sp5.zip";
+        a.click();
+        URL.revokeObjectURL(url);
+
+      } catch (err) {
+        console.error(err);
+        progressStatus.textContent = "Error: " + err.message;
+        progressStatus.style.color = "#ff4b8e";
+      } finally {
+        convertBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

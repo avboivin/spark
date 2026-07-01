@@ -8,6 +8,7 @@ export { SpzReader, SpzWriter, transcodeSpz } from './spz';
 export { PackedSplats, type PackedSplatsOptions } from './PackedSplats';
 export { ExtSplats, type ExtSplatsOptions } from './ExtSplats';
 export * from './SplatPager';
+export { SplatWorker, NewSplatWorkerPool } from './SplatWorker';
 export { SplatGenerator, type GsplatGenerator, SplatModifier, type GsplatModifier, SplatTransformer, } from './SplatGenerator';
 export { Readback, type Rgba8Readback, type ReadbackBuffer } from './Readback';
 export { SplatMesh, type SplatMeshOptions, type SplatMeshContext, } from './SplatMesh';

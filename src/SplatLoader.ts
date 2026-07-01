@@ -422,6 +422,9 @@ export function getSplatFileType(
     if (tryPcSogsZip(fileBytes)) {
       return SplatFileType.PCSOGSZIP;
     }
+    if (trySp5Zip(fileBytes)) {
+      return SplatFileType.SP5;
+    }
     // Unknown PKZip file type
     return undefined;
   }
@@ -478,6 +481,14 @@ export function getSplatFileTypeFromPath(
   }
   if (extension === "sp5") {
     return SplatFileType.SP5;
+  }
+  if (extension === "json" && pathOrUrl.includes("manifest.json")) {
+    return SplatFileType.SP5;
+  }
+  if (extension === "zip") {
+    // If it's a zip file dropped, we will determine it by checking its magic bytes
+    // (getSplatFileType) so we default to undefined here to trigger byte inspection.
+    return undefined;
   }
   return undefined;
 }
@@ -640,6 +651,29 @@ export function tryPcSogsZip(
     return { name: metaFilename, json };
   } catch {
     return undefined;
+  }
+}
+
+export function trySp5Zip(
+  input: ArrayBuffer | Uint8Array,
+): boolean {
+  try {
+    const fileBytes =
+      input instanceof ArrayBuffer ? new Uint8Array(input) : input;
+    let hasManifest = false;
+    unzipSync(fileBytes, {
+      filter: ({ name }) => {
+        const filename = name.split(/[\\/]/).pop() as string;
+        if (filename === "manifest.json") {
+          hasManifest = true;
+          return true;
+        }
+        return false;
+      },
+    });
+    return hasManifest;
+  } catch {
+    return false;
   }
 }
 
