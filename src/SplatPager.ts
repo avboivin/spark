@@ -193,9 +193,6 @@ export class PagedSplats implements SplatSource {
     if (this.fileType === SplatFileType.RAD) {
       this.radMetaPromise = this.getRadMeta();
     }
-    if (this.fileType === SplatFileType.SP5 && this.pager) {
-      (this.pager as any).extSplats = true;
-    }
     if (this.pager) {
       this.pager.activeSplats.add(this);
     }
@@ -385,7 +382,26 @@ export class PagedSplats implements SplatSource {
         throw new Error("PagedSplats.pager not set");
       }
       let lodSplats: PackedResult | ExtResult;
-      if (!this.pager.extSplats) {
+      if (this.fileType === SplatFileType.SP5) {
+        const result = (await worker.call("decodeSp5Chunk", {
+          chunkBytes: decodeBytes!.slice(),
+        })) as PackedResult;
+        lodSplats = result;
+        if (!this.splatEncoding) {
+          this.splatEncoding = DEFAULT_SPLAT_ENCODING;
+          this.numSh =
+            lodSplats.extra.sh3
+              ? 3
+              : lodSplats.extra.sh2
+                ? 2
+                : lodSplats.extra.sh1
+                  ? 1
+                  : 0;
+        }
+        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
+        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
+        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
+      } else if (!this.pager.extSplats) {
         const result = (await worker.call("loadPackedSplats", {
           fileBytes: decodeBytes!.slice(),
           pathName: this.chunkUrl(chunk),
@@ -419,25 +435,6 @@ export class PagedSplats implements SplatSource {
             this.splatEncoding.sh2Max ?? 1.0,
             this.splatEncoding.sh3Max ?? 1.0,
           );
-        }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-      } else if (this.fileType === SplatFileType.SP5) {
-        const result = (await worker.call("decodeSp5Chunk", {
-          chunkBytes: decodeBytes!.slice(),
-        })) as ExtResult;
-        lodSplats = result;
-        if (!this.splatEncoding) {
-          this.splatEncoding = DEFAULT_SPLAT_ENCODING;
-          this.numSh =
-            lodSplats.extra.sh3a && lodSplats.extra.sh3b
-              ? 3
-              : lodSplats.extra.sh2
-                ? 2
-                : lodSplats.extra.sh1
-                  ? 1
-                  : 0;
         }
         this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
         this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
@@ -1442,7 +1439,6 @@ export class SplatPager {
         lodTree: extra.lodTree as Uint32Array,
       });
 
-      console.log("processFetched: data =", data, "this.extSplats =", this.extSplats);
       if (isExtResult(data, this.extSplats)) {
         const extArrays = data.extArrays;
         const packedArray = extArrays[0];

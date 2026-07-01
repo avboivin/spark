@@ -1284,7 +1284,7 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
     mlpOffsetB3,
   );
 
-  const result = toExtResult(gsplatArray.to_extsplats() as any);
+  const result = toPackedResult(gsplatArray.to_packedsplats(null as any) as any);
   gsplatArray.free();
   return result;
 }
