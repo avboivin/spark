@@ -269,6 +269,31 @@
       loadSplatFile(event.target.files[0]);
     };
 
+    function onSplatLoad(mesh) {
+      console.log("SplatMesh loaded!");
+      try {
+        const box = mesh.getBoundingBox();
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        
+        console.log("SplatMesh bounding box center:", center, "size:", size);
+        
+        // Adjust camera position
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const fov = camera.fov * (Math.PI / 180);
+        let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+        cameraZ *= 1.5; // zoom out a bit to fit comfortably
+        
+        // Position camera to look at center
+        camera.position.set(center.x, center.y, center.z + cameraZ);
+        camera.lookAt(center);
+      } catch (e) {
+        console.error("Error centering camera:", e);
+      }
+    }
+
     async function loadSplatFile(splatFile) {
       const maxCacheSplats = parseInt(document.querySelector('#max-cache-splats')?.value || "16777216");
       const backgroundPrefetch = document.querySelector('#background-prefetch')?.checked || false;
@@ -282,7 +307,8 @@
           renderer: renderer,
           maxCacheSplats,
           backgroundPrefetch
-        })
+        }),
+        onLoad: onSplatLoad
       });
     }
 
@@ -308,7 +334,7 @@
       fileName = splatURL.split("/").pop().split("?")[0];
       document.querySelector('.container').classList.add('hidden');
       document.querySelector('.canvas-container').classList.remove('invisible');
-      setSplatFile({ url: splatURL });
+      setSplatFile({ url: splatURL, onLoad: onSplatLoad });
     }
 
     const urlFormEl = document.querySelector('.url-form');
