@@ -758,18 +758,6 @@ pub fn reconstruct_sp5_chunk(
             rotation_codebook[512 + r_idx1 * 2 + 1],
         ];
 
-        let a_idx0 = app_indices[i] as usize;
-        let a_idx1 = app_indices[num_points + i] as usize;
-        let a_idx2 = app_indices[2 * num_points + i] as usize;
-        let app_val = [
-            app_codebook[a_idx0 * 2 + 0],
-            app_codebook[a_idx0 * 2 + 1],
-            app_codebook[512 + a_idx1 * 2 + 0],
-            app_codebook[512 + a_idx1 * 2 + 1],
-            app_codebook[1024 + a_idx2 * 2 + 0],
-            app_codebook[1024 + a_idx2 * 2 + 1],
-        ];
-
         let opacity_raw;
         let mut dc_raw;
         let mut sh_raw;
@@ -783,6 +771,18 @@ pub fn reconstruct_sp5_chunk(
                 }
             }
         } else {
+            let a_idx0 = app_indices[i] as usize;
+            let a_idx1 = app_indices[num_points + i] as usize;
+            let a_idx2 = app_indices[2 * num_points + i] as usize;
+            let app_val = [
+                app_codebook[a_idx0 * 2 + 0],
+                app_codebook[a_idx0 * 2 + 1],
+                app_codebook[512 + a_idx1 * 2 + 0],
+                app_codebook[512 + a_idx1 * 2 + 1],
+                app_codebook[1024 + a_idx2 * 2 + 0],
+                app_codebook[1024 + a_idx2 * 2 + 1],
+            ];
+
             let uni = contract_to_unisphere(px, py, pz);
             let mut encoded_xyz = [0.0f32; 96];
             get_tcnn_frequency_encoding(uni, 16, &mut encoded_xyz);

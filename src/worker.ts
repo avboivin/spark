@@ -996,10 +996,15 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
       manifest.xyz_uncompressed.offset + manifest.xyz_uncompressed.length,
     );
     // Convert float16 to float32
+    let alignedBytes = xyzBytes;
+    if (xyzBytes.byteOffset % 2 !== 0) {
+      alignedBytes = new Uint8Array(xyzBytes.length);
+      alignedBytes.set(xyzBytes);
+    }
     const u16 = new Uint16Array(
-      xyzBytes.buffer,
-      xyzBytes.byteOffset,
-      xyzBytes.byteLength / 2,
+      alignedBytes.buffer,
+      alignedBytes.byteOffset,
+      alignedBytes.byteLength / 2,
     );
     for (let i = 0; i < u16.length; i++) {
       xyzRawFloat[i] = halfToFloat(u16[i]);
@@ -1187,10 +1192,15 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
   }
 
   function float16ArrayToFloat32Array(bytes: Uint8Array) {
+    let alignedBytes = bytes;
+    if (bytes.byteOffset % 2 !== 0) {
+      alignedBytes = new Uint8Array(bytes.length);
+      alignedBytes.set(bytes);
+    }
     const u16 = new Uint16Array(
-      bytes.buffer,
-      bytes.byteOffset,
-      bytes.byteLength / 2,
+      alignedBytes.buffer,
+      alignedBytes.byteOffset,
+      alignedBytes.byteLength / 2,
     );
     const out = new Float32Array(u16.length);
     for (let i = 0; i < u16.length; i++) {
