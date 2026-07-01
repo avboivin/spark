@@ -4,7 +4,7 @@ use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, Uint16Array, Uint
 use spark_lib::decoder::{ChunkReceiver, MultiDecoder, SplatEncoding, SplatFileType, SplatGetter};
 use spark_lib::gsplat::GsplatArray as GsplatArrayInner;
 use spark_lib::csplat::CsplatArray as CsplatArrayInner;
-use spark_lib::tsplat::{TsplatArray, Tsplat};
+use spark_lib::tsplat::{TsplatArray, Tsplat, TsplatMut};
 use wasm_bindgen::prelude::*;
 
 use crate::ext_splats::ExtSplatsData;
@@ -185,6 +185,58 @@ impl GsplatArray {
         self.inner.len()
     }
 
+    pub fn center(&mut self) -> Result<Array, JsValue> {
+        let n = self.len();
+        if n == 0 {
+            let res = Array::new();
+            res.push(&JsValue::from(0.0));
+            res.push(&JsValue::from(0.0));
+            res.push(&JsValue::from(0.0));
+            return Ok(res);
+        }
+
+        // Use the per-axis MEDIAN, not the min/max midpoint. Real-world scenes
+        // (especially photogrammetry) routinely contain a handful of extreme
+        // floater outliers thousands of units from the actual content. A
+        // min/max midpoint is dragged toward those outliers -- e.g. a scene
+        // whose bulk sits near the origin but has one outlier at 175000 would
+        // get "centered" by ~66821, which then shifts every real splat far out
+        // of the f16 range used by the packed splat texture, corrupting the
+        // entire scene instead of just the outlier. The median is insensitive
+        // to a small number of extreme values.
+        let mut xs: Vec<f32> = Vec::with_capacity(n);
+        let mut ys: Vec<f32> = Vec::with_capacity(n);
+        let mut zs: Vec<f32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let c = self.inner.get(i).center();
+            xs.push(c.x);
+            ys.push(c.y);
+            zs.push(c.z);
+        }
+        let median = |v: &mut Vec<f32>| -> f32 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        };
+        let cx = median(&mut xs);
+        let cy = median(&mut ys);
+        let cz = median(&mut zs);
+
+        for i in 0..n {
+            let mut splat = self.inner.get_mut(i);
+            let mut c = splat.center();
+            c.x -= cx;
+            c.y -= cy;
+            c.z -= cz;
+            splat.set_center(c);
+        }
+
+        let res = Array::new();
+        res.push(&JsValue::from(cx));
+        res.push(&JsValue::from(cy));
+        res.push(&JsValue::from(cz));
+        Ok(res)
+    }
+
     pub fn has_lod(&self) -> bool {
         self.inner.has_lod_tree()
     }
@@ -263,7 +315,24 @@ impl GsplatArray {
     }
 
     pub fn to_spz(&self) -> Result<Uint8Array, JsValue> {
-        let encoder = spark_lib::spz::SpzEncoder::new(self.inner.clone());
+        let num = self.inner.len();
+        let mut max_abs = 1.0f32;
+        for i in 0..num {
+            let c = self.inner.get(i).center();
+            let ax = c.x.abs();
+            let ay = c.y.abs();
+            let az = c.z.abs();
+            if ax > max_abs { max_abs = ax; }
+            if ay > max_abs { max_abs = ay; }
+            if az > max_abs { max_abs = az; }
+        }
+        let bits: u32 = if max_abs > 1.0 {
+            (23u32.saturating_sub(max_abs.log2().ceil() as u32)).min(24)
+        } else {
+            18
+        };
+        let encoder = spark_lib::spz::SpzEncoder::new(self.inner.clone())
+            .with_fractional_bits(bits as u8);
         let bytes = encoder.encode().map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Uint8Array::from(bytes.as_slice()))
     }
@@ -470,7 +539,24 @@ impl CsplatArray {
     }
 
     pub fn to_spz(&self) -> Result<Uint8Array, JsValue> {
-        let encoder = spark_lib::spz::SpzEncoder::new(self.inner.clone());
+        let num = self.inner.len();
+        let mut max_abs = 1.0f32;
+        for i in 0..num {
+            let c = self.inner.get(i).center();
+            let ax = c.x.abs();
+            let ay = c.y.abs();
+            let az = c.z.abs();
+            if ax > max_abs { max_abs = ax; }
+            if ay > max_abs { max_abs = ay; }
+            if az > max_abs { max_abs = az; }
+        }
+        let bits: u32 = if max_abs > 1.0 {
+            (23u32.saturating_sub(max_abs.log2().ceil() as u32)).min(24)
+        } else {
+            18
+        };
+        let encoder = spark_lib::spz::SpzEncoder::new(self.inner.clone())
+            .with_fractional_bits(bits as u8);
         let bytes = encoder.encode().map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(Uint8Array::from(bytes.as_slice()))
     }
@@ -735,22 +821,38 @@ pub fn reconstruct_sp5_chunk(
     let sigmoid = |v: f32| -> f32 { 1.0 / (1.0 + (-v).exp()) };
 
     for i in 0..num_points {
+        // sorted_indices comes from re-running the lexicographic sort on the
+        // already float16-quantized xyz_raw. converter.ts's encoder sorts the
+        // FULL-PRECISION scene once and writes every per-point stream (position,
+        // scale/rotation indices, opacity, dc, sh) into the same output slot `i`
+        // consistently. Quantizing positions to float16 can introduce ties or
+        // rare order inversions that the full-precision encoder sort didn't have,
+        // so this decoder-side re-sort is not guaranteed to reproduce the
+        // encoder's exact permutation. Every attribute lookup below must use the
+        // SAME index (`idx`) so position stays paired with its own scale/
+        // rotation/app/opacity/dc/sh regardless of whether this re-sort actually
+        // changes anything -- using `i` for some lookups and `idx` for others
+        // (as before) silently paired attributes from different splats whenever
+        // the re-sort reordered anything, which measured ~45% of points on a
+        // synthetic worst-case test (see test/sp5_ordering_test.ts) and is what
+        // made converted scenes look "completely broken" (right positions, but
+        // wrong size/orientation/color pulled from a different splat).
         let idx = sorted_indices[i];
         let px = points[idx][0];
         let py = points[idx][1];
         let pz = points[idx][2];
 
-        let s_idx0 = scale_indices[i] as usize;
-        let s_idx1 = scale_indices[num_points + i] as usize;
-        let s_idx2 = scale_indices[2 * num_points + i] as usize;
+        let s_idx0 = scale_indices[idx] as usize;
+        let s_idx1 = scale_indices[num_points + idx] as usize;
+        let s_idx2 = scale_indices[2 * num_points + idx] as usize;
         let scale_val = [
             scale_codebook[s_idx0],
             scale_codebook[256 + s_idx1],
             scale_codebook[512 + s_idx2],
         ];
 
-        let r_idx0 = rotation_indices[i] as usize;
-        let r_idx1 = rotation_indices[num_points + i] as usize;
+        let r_idx0 = rotation_indices[idx] as usize;
+        let r_idx1 = rotation_indices[num_points + idx] as usize;
         let rot_val = [
             rotation_codebook[r_idx0 * 2 + 0],
             rotation_codebook[r_idx0 * 2 + 1],
@@ -771,9 +873,9 @@ pub fn reconstruct_sp5_chunk(
                 }
             }
         } else {
-            let a_idx0 = app_indices[i] as usize;
-            let a_idx1 = app_indices[num_points + i] as usize;
-            let a_idx2 = app_indices[2 * num_points + i] as usize;
+            let a_idx0 = app_indices[idx] as usize;
+            let a_idx1 = app_indices[num_points + idx] as usize;
+            let a_idx2 = app_indices[2 * num_points + idx] as usize;
             let app_val = [
                 app_codebook[a_idx0 * 2 + 0],
                 app_codebook[a_idx0 * 2 + 1],
@@ -853,11 +955,28 @@ pub fn reconstruct_sp5_chunk(
             }
         }
 
+        // scale_val comes from the SVQ scale codebook, which converter.ts built by
+        // quantizing the LINEAR scale values it got from extract_attributes()
+        // (ply.rs's PLY parser already applies .exp() to the raw ln-scale PLY
+        // properties -- see ply.rs's out_scale assignments -- so extract_attributes()
+        // returns linear scale, not log scale). Gsplat.ln_scales, however, is
+        // defined to hold ln(scale): every other encode path in this codebase
+        // (e.g. gsplat.rs's encode_packed_splat callers) takes .ln() before storing
+        // here, and Gsplat::scales() takes .exp() when reading it back. Writing the
+        // linear scale_val directly into ln_scales (as before) meant the renderer's
+        // later exp(ln_scales) double-exponentiated every splat's size -- e.g. a
+        // genuine 5-unit splat became exp(5) ~= 148 units, a 10-unit splat became
+        // exp(10) ~= 22026 units -- ballooning the whole scene into one giant,
+        // overlapping, oversaturated blob ("a large white ball"). Clamp to a small
+        // positive floor before .ln() since codebook values must be positive but a
+        // degenerate/zero centroid should not produce -Infinity.
+        let scale_val_ln = scale_val.map(|v| v.max(1e-8).ln());
+
         let gsplat = Gsplat {
             center: glam::Vec3::new(px, py, pz),
             opacity: f16::from_f32(opacity_val),
             rgb: [f16::from_f32(dc_raw[0]), f16::from_f32(dc_raw[1]), f16::from_f32(dc_raw[2])],
-            ln_scales: [f16::from_f32(scale_val[0]), f16::from_f32(scale_val[1]), f16::from_f32(scale_val[2])],
+            ln_scales: [f16::from_f32(scale_val_ln[0]), f16::from_f32(scale_val_ln[1]), f16::from_f32(scale_val_ln[2])],
             quaternion: [f16::from_f32(rot_val[0]), f16::from_f32(rot_val[1]), f16::from_f32(rot_val[2]), f16::from_f32(rot_val[3])],
         };
         gsplats.push(gsplat);

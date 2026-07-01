@@ -26,12 +26,38 @@ pub fn get_splat_tex_size(num_splats: usize) -> (usize, usize, usize, usize) {
     (width, height, depth, max_splats)
 }
 
+/// Largest finite magnitude representable by IEEE-754 binary16 (f16).
+pub const F16_MAX_FINITE: f32 = 65504.0;
+
+/// Spark packs splat centers as f16. Coordinates beyond the f16 finite range
+/// (e.g. photogrammetry floater outliers, which can reach hundreds of thousands
+/// of units) would convert to +/-Infinity, which then poisons every downstream
+/// consumer of the packed texture -- bounding-box computation, camera-fit, and
+/// LOD pixel-scale math all propagate the Infinity and the scene disappears.
+/// Clamp non-finite and out-of-range coordinates into the representable range so
+/// the texture never contains Infinity/NaN. Out-of-range splats are pinned to the
+/// range boundary rather than dropped (callers that want outlier-free bounds
+/// should compute robust bounds separately).
+#[inline]
+pub fn clamp_center_coord(x: f32) -> f32 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x.clamp(-F16_MAX_FINITE, F16_MAX_FINITE)
+    }
+}
+
+#[inline]
+fn center_coord_to_f16_bits(x: f32) -> u16 {
+    f16::from_f32(clamp_center_coord(x)).to_bits()
+}
+
 pub fn encode_packed_splat(packed: &mut [u32], center: [f32; 3], opacity: f32, rgb: [f32; 3], scale: [f32; 3], quat_xyzw: [f32; 4], encoding: &SplatEncoding) {
     let SplatEncoding { rgb_min, rgb_max, ln_scale_min, ln_scale_max, lod_opacity, .. } = encoding;
 
     let u_rgb = rgb.map(|x| float_to_u8(x, *rgb_min, *rgb_max));
     let u_a = float_to_u8(opacity, 0.0, if *lod_opacity { 2.0 } else { 1.0 });
-    let u_center = center.map(|x| f16::from_f32(x).to_bits());
+    let u_center = center.map(center_coord_to_f16_bits);
     let u_quat = encode_quat_oct888(quat_xyzw);
     let u_scale = scale.map(|x| encode_scale8(x, *ln_scale_min, *ln_scale_max));
 
@@ -42,7 +68,7 @@ pub fn encode_packed_splat(packed: &mut [u32], center: [f32; 3], opacity: f32, r
 }
 
 pub fn encode_packed_splat_center(packed: &mut [u32], center: [f32; 3]) {
-    let u_center = center.map(|x| f16::from_f32(x).to_bits());
+    let u_center = center.map(center_coord_to_f16_bits);
     packed[1] = (u_center[0] as u32) | ((u_center[1] as u32) << 16);
     packed[2] = (packed[2] & 0xffff0000) | (u_center[2] as u32);
 }
@@ -478,13 +504,13 @@ pub fn decode_sh3_internal_words(words: [u32; 4], sh3_scale: f32) -> [f32; 21] {
 }
 
 pub fn encode_lod_tree(buffer: &mut [u32], center: &[f32], opacity: f32, scale: &[f32], child_count: u16, child_start: u32) {
-    let center: [f16; 3] = array::from_fn(|d| f16::from_f32(center[d]));
+    let center: [f16; 3] = array::from_fn(|d| f16::from_f32(clamp_center_coord(center[d])));
     let avg_scale = (scale[0] + scale[1] + scale[2]) / 3.0;
     let expansion = if opacity <= 1.0 { 1.0 } else {
         let a = opacity * 4.0 - 3.0;
         1.0 + 0.7 * (a - 1.0)
     };
-    let size = f16::from_f32(2.0 * expansion * avg_scale);
+    let size = f16::from_f32(clamp_center_coord(2.0 * expansion * avg_scale));
     buffer[0] = (center[0].to_bits() as u32) | ((center[1].to_bits() as u32) << 16);
     buffer[1] = (center[2].to_bits() as u32) | ((size.to_bits() as u32) << 16);
     buffer[2] = child_count as u32;
@@ -495,4 +521,35 @@ pub fn decode_lod_tree_children(buffer: &[u32]) -> (u16, u32) {
     let child_count = (buffer[2] & 0xffff) as u16;
     let child_start = buffer[3] as u32;
     (child_count, child_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: photogrammetry floater outliers (coords up to ~175000) must not
+    // pack into the f16 center texture as +/-Infinity, which poisons bounding-box
+    // and camera-fit math and makes the whole scene disappear.
+    #[test]
+    fn out_of_range_centers_clamp_to_finite() {
+        let mut packed = [0u32; 4];
+        encode_packed_splat_center(&mut packed, [175088.0, -93618.5, 60000.0]);
+        let decoded = decode_packed_splat_center(&packed);
+        assert!(decoded.iter().all(|v| v.is_finite()), "decoded center must be finite, got {decoded:?}");
+        assert_eq!(decoded[0], F16_MAX_FINITE, "positive overflow clamps to +max");
+        assert_eq!(decoded[1], -F16_MAX_FINITE, "negative overflow clamps to -max");
+        // In-range coordinates round-trip through f16 approximately unchanged.
+        assert!((decoded[2] - 60000.0).abs() < 64.0, "in-range coord preserved, got {}", decoded[2]);
+    }
+
+    #[test]
+    fn nan_and_infinity_centers_become_finite() {
+        let mut packed = [0u32; 4];
+        encode_packed_splat_center(&mut packed, [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        let decoded = decode_packed_splat_center(&packed);
+        assert!(decoded.iter().all(|v| v.is_finite()), "NaN/Inf must not survive packing, got {decoded:?}");
+        assert_eq!(decoded[0], 0.0, "NaN maps to 0");
+        assert_eq!(decoded[1], F16_MAX_FINITE);
+        assert_eq!(decoded[2], -F16_MAX_FINITE);
+    }
 }
