@@ -8,8 +8,24 @@ export interface PagedSplatsOptions {
     requestHeader?: Record<string, string>;
     withCredentials?: boolean;
     fileBytes?: Uint8Array;
+    fileBlob?: Blob;
     fileType?: SplatFileType;
     maxSh?: number;
+}
+export interface ChunkSource {
+    read(offset?: number, bytes?: number): Promise<Uint8Array>;
+}
+export declare class HttpChunkSource implements ChunkSource {
+    private url;
+    private requestHeader?;
+    private withCredentials?;
+    constructor(url: string, requestHeader?: Record<string, string> | undefined, withCredentials?: boolean | undefined);
+    read(offset?: number, bytes?: number): Promise<Uint8Array>;
+}
+export declare class BlobChunkSource implements ChunkSource {
+    private blob;
+    constructor(blob: Blob);
+    read(offset?: number, bytes?: number): Promise<Uint8Array>;
 }
 export declare class PagedSplats implements SplatSource {
     pager?: SplatPager;
@@ -17,6 +33,8 @@ export declare class PagedSplats implements SplatSource {
     requestHeader?: Record<string, string>;
     withCredentials?: boolean;
     fileBytes?: Uint8Array;
+    fileBlob?: Blob;
+    chunkSource?: ChunkSource;
     fileType?: SplatFileType;
     numSh: number;
     maxSh: number;
@@ -81,18 +99,37 @@ export interface SplatPagerOptions {
      */
     autoDrive?: boolean;
     /**
-     * Number of parallel chunk fetchers
+     * Number of concurrent fetchers
      * @default 3
      */
     numFetchers?: number;
+    /**
+     * Maximum size of IndexedDB cache in splats
+     */
+    maxCacheSplats?: number;
+    /**
+     * Proactively fetch and cache chunks in the background
+     * @default false
+     */
+    backgroundPrefetch?: boolean;
+}
+interface PageUpload {
+    page: number;
+    numSplats: number;
+    packedArray: Uint32Array;
+    extArray?: Uint32Array;
+    shArrays: Array<Uint32Array>;
 }
 export declare class SplatPager {
-    renderer: THREE.WebGLRenderer;
-    extSplats: boolean;
-    maxPages: number;
-    maxSplats: number;
-    pageSplats: number;
-    maxSh: number;
+    readonly renderer: THREE.WebGLRenderer;
+    readonly extSplats: boolean;
+    readonly maxPages: number;
+    readonly maxSplats: number;
+    readonly pageSplats: number;
+    readonly maxCacheSplats: number;
+    backgroundPrefetch: boolean;
+    activeSplats: Set<PagedSplats>;
+    readonly maxSh: number;
     curSh: number;
     autoDrive: boolean;
     numFetchers: number;
@@ -112,20 +149,8 @@ export declare class SplatPager {
         lru: number;
     }>;
     freeablePages: number[];
-    newUploads: {
-        page: number;
-        numSplats: number;
-        packedArray: Uint32Array;
-        extArray?: Uint32Array;
-        extra: Record<string, unknown>;
-    }[];
-    readyUploads: {
-        page: number;
-        numSplats: number;
-        packedArray: Uint32Array;
-        extArray?: Uint32Array;
-        extra: Record<string, unknown>;
-    }[];
+    newUploads: PageUpload[];
+    readyUploads: PageUpload[];
     lodTreeUpdates: {
         splats: PagedSplats;
         page: number;
@@ -149,10 +174,12 @@ export declare class SplatPager {
     }[];
     packedTexture: dyno.DynoUsampler2DArray<"packedTexture", THREE.DataArrayTexture>;
     extTexture: dyno.DynoUsampler2DArray<"extTexture", THREE.DataArrayTexture>;
-    sh1Texture: dyno.DynoUsampler2DArray<"sh1", THREE.DataArrayTexture>;
-    sh2Texture: dyno.DynoUsampler2DArray<"sh2", THREE.DataArrayTexture>;
-    sh3Texture: dyno.DynoUsampler2DArray<"sh3", THREE.DataArrayTexture>;
-    sh3TextureB: dyno.DynoUsampler2DArray<"sh3b", THREE.DataArrayTexture>;
+    readonly shTextures: [
+        dyno.DynoUsampler2DArray<"sh1", THREE.DataArrayTexture>,
+        dyno.DynoUsampler2DArray<"sh2", THREE.DataArrayTexture>,
+        dyno.DynoUsampler2DArray<"sh3", THREE.DataArrayTexture>,
+        dyno.DynoUsampler2DArray<"sh3b", THREE.DataArrayTexture>
+    ];
     readIndex: dyno.DynoBlock<{
         index: "int";
         numSplats: "int";
@@ -193,17 +220,18 @@ export declare class SplatPager {
     dispose(): void;
     private ensureShTextures;
     private allocatePage;
-    private freePage;
     getSplatsChunk(splats: PagedSplats, chunk: number): {
         page: number;
         lru: number;
     } | undefined;
     private insertSplatsChunkPage;
     private removeSplatsChunkPage;
+    removeSplats(splats: PagedSplats): void;
     private uploadPage;
-    private getGlTexture;
     private newUint32ArrayTexture;
     driveFetchers(): void;
+    private runBackgroundPrefetch;
+    private prefetchChunk;
     private allocateFreeable;
     private processFetched;
     processUploads(): void;
@@ -219,11 +247,7 @@ export declare class SplatPager {
     static emptyIndicesTexture: THREE.DataTexture;
     static emptyPackedTexture: THREE.DataArrayTexture;
     static emptyExtTexture: THREE.DataArrayTexture;
-    static emptySh1Texture: THREE.DataArrayTexture;
-    static emptySh2Texture: THREE.DataArrayTexture;
-    static emptySh3Texture: THREE.DataArrayTexture;
-    static emptyExtSh1Texture: THREE.DataArrayTexture;
-    static emptyExtSh2Texture: THREE.DataArrayTexture;
-    static emptyExtSh3Texture: THREE.DataArrayTexture;
-    static emptyExtSh3BTexture: THREE.DataArrayTexture;
+    static emptyShTextures: readonly [THREE.DataArrayTexture, THREE.DataArrayTexture, THREE.DataArrayTexture];
+    static emptyExtShTextures: readonly [THREE.DataArrayTexture, THREE.DataArrayTexture, THREE.DataArrayTexture, THREE.DataArrayTexture];
 }
+export {};

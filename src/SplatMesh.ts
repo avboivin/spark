@@ -57,6 +57,8 @@ export type SplatMeshOptions = {
   // Raw bytes of a Gaussian splat file to decode directly instead of fetching
   // from URL. (default: undefined)
   fileBytes?: Uint8Array | ArrayBuffer;
+  // File blob of a local dropped file.
+  fileBlob?: Blob;
   // Override the file type detection for formats that can't be reliably
   // auto-detected (.splat, .ksplat). (default: undefined auto-detects other
   // formats from file contents)
@@ -323,12 +325,18 @@ export class SplatMesh extends SplatGenerator {
         );
       }
       const rootUrl = options.url ?? "";
+      const pagedOptions = {
+        rootUrl,
+        fileBytes: options.fileBytes ? new Uint8Array(options.fileBytes) : undefined,
+        fileBlob: options.fileBlob,
+        fileType: options.fileType,
+      };
       if (options.paged === true) {
-        this.paged = new PagedSplats({ rootUrl });
+        this.paged = new PagedSplats(pagedOptions);
       } else if (options.paged instanceof PagedSplats) {
         this.paged = options.paged;
       } else if (options.paged instanceof SplatPager) {
-        this.paged = new PagedSplats({ rootUrl, pager: options.paged });
+        this.paged = new PagedSplats({ ...pagedOptions, pager: options.paged });
       } else {
         throw new Error("Invalid paged option");
       }

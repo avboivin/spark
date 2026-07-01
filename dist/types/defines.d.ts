@@ -24,7 +24,8 @@ export declare enum SplatFileType {
     KSPLAT = "ksplat",
     PCSOGS = "pcsogs",
     PCSOGSZIP = "pcsogszip",
-    RAD = "rad"
+    RAD = "rad",
+    SP5 = "sp5"
 }
 export type SplatEncoding = {
     rgbMin?: number;

@@ -257,6 +257,16 @@ impl GsplatArray {
     pub fn inject_rgba8(&mut self, rgba: Uint8Array) {
         self.inner.inject_rgba8(&rgba.to_vec());
     }
+
+    pub fn clone_subset(&self, start: usize, count: usize) -> GsplatArray {
+        GsplatArray::new(self.inner.clone_subset(start, count))
+    }
+
+    pub fn to_spz(&self) -> Result<Uint8Array, JsValue> {
+        let encoder = spark_lib::spz::SpzEncoder::new(self.inner.clone());
+        let bytes = encoder.encode().map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(Uint8Array::from(bytes.as_slice()))
+    }
 }
 
 #[wasm_bindgen]
@@ -378,6 +388,16 @@ impl CsplatArray {
 
     pub fn inject_rgba8(&mut self, rgba: Uint8Array) {
         self.inner.inject_rgba8(&rgba.to_vec());
+    }
+
+    pub fn clone_subset(&self, start: usize, count: usize) -> CsplatArray {
+        CsplatArray::new(self.inner.clone_subset(start, count))
+    }
+
+    pub fn to_spz(&self) -> Result<Uint8Array, JsValue> {
+        let encoder = spark_lib::spz::SpzEncoder::new(self.inner.clone());
+        let bytes = encoder.encode().map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(Uint8Array::from(bytes.as_slice()))
     }
 }
 
@@ -599,4 +619,182 @@ pub fn decode_rad_header(bytes: Uint8Array) -> Result<JsValue, JsValue> {
     } else {
         Ok(JsValue::null())
     }
+}
+
+#[wasm_bindgen]
+pub fn reconstruct_sp5_chunk(
+    xyz_raw: &[f32],
+    scale_indices: &[u16],
+    rotation_indices: &[u16],
+    app_indices: &[u16],
+    scale_codebook: &[f32],
+    rotation_codebook: &[f32],
+    app_codebook: &[f32],
+    mlp_cont: &[f32],
+    mlp_dc: &[f32],
+    mlp_sh: &[f32],
+    mlp_opacity: &[f32],
+    mlp_offset_w0: &[f32],
+    mlp_offset_b0: &[f32],
+    mlp_offset_w1: &[f32],
+    mlp_offset_b1: &[f32],
+    mlp_offset_w2: &[f32],
+    mlp_offset_b2: &[f32],
+    mlp_offset_w3: &[f32],
+    mlp_offset_b3: &[f32],
+) -> GsplatArray {
+    use spark_lib::sp5::{contract_to_unisphere, get_tcnn_frequency_encoding, run_tcnn_mlp, run_pytorch_mlp, Activation};
+    use spark_lib::gsplat::{Gsplat, GsplatSH1, GsplatArray as GsplatArrayInner};
+    use half::f16;
+
+    let num_points = xyz_raw.len() / 3;
+    let mut points = Vec::with_capacity(num_points);
+    for i in 0..num_points {
+        points.push([xyz_raw[i * 3 + 0], xyz_raw[i * 3 + 1], xyz_raw[i * 3 + 2]]);
+    }
+    let sorted_indices = spark_lib::sp5::stable_lexicographic_sort(&points);
+
+    let mut gsplats = Vec::with_capacity(num_points);
+    let mut sh1_vec = Vec::with_capacity(num_points);
+
+    let sigmoid = |v: f32| -> f32 { 1.0 / (1.0 + (-v).exp()) };
+
+    for i in 0..num_points {
+        let idx = sorted_indices[i];
+        let px = points[idx][0];
+        let py = points[idx][1];
+        let pz = points[idx][2];
+
+        let uni = contract_to_unisphere(px, py, pz);
+        let mut encoded_xyz = [0.0f32; 96];
+        get_tcnn_frequency_encoding(uni, 16, &mut encoded_xyz);
+
+        let cont_feature = run_tcnn_mlp(&encoded_xyz, mlp_cont, 96, 64, 13, 1, Activation::ReLU);
+
+        let s_idx0 = scale_indices[i] as usize;
+        let s_idx1 = scale_indices[num_points + i] as usize;
+        let s_idx2 = scale_indices[2 * num_points + i] as usize;
+        let scale_val = [
+            scale_codebook[s_idx0],
+            scale_codebook[256 + s_idx1],
+            scale_codebook[512 + s_idx2],
+        ];
+
+        let r_idx0 = rotation_indices[i] as usize;
+        let r_idx1 = rotation_indices[num_points + i] as usize;
+        let rot_val = [
+            rotation_codebook[r_idx0 * 2 + 0],
+            rotation_codebook[r_idx0 * 2 + 1],
+            rotation_codebook[512 + r_idx1 * 2 + 0],
+            rotation_codebook[512 + r_idx1 * 2 + 1],
+        ];
+
+        let a_idx0 = app_indices[i] as usize;
+        let a_idx1 = app_indices[num_points + i] as usize;
+        let a_idx2 = app_indices[2 * num_points + i] as usize;
+        let app_val = [
+            app_codebook[a_idx0 * 2 + 0],
+            app_codebook[a_idx0 * 2 + 1],
+            app_codebook[512 + a_idx1 * 2 + 0],
+            app_codebook[512 + a_idx1 * 2 + 1],
+            app_codebook[1024 + a_idx2 * 2 + 0],
+            app_codebook[1024 + a_idx2 * 2 + 1],
+        ];
+
+        let mut space_feature = [0.0f32; 16];
+        space_feature[0..13].copy_from_slice(&cont_feature);
+        space_feature[13] = app_val[0];
+        space_feature[14] = app_val[1];
+        space_feature[15] = app_val[2];
+
+        let mut view_feature = [0.0f32; 16];
+        view_feature[0..13].copy_from_slice(&cont_feature);
+        view_feature[13] = app_val[3];
+        view_feature[14] = app_val[4];
+        view_feature[15] = app_val[5];
+
+        let opacity_raw = run_tcnn_mlp(&space_feature, mlp_opacity, 16, 64, 1, 1, Activation::LeakyReLU);
+        let mut dc_raw = run_tcnn_mlp(&space_feature, mlp_dc, 16, 64, 3, 1, Activation::LeakyReLU);
+        let mut sh_raw = run_tcnn_mlp(&view_feature, mlp_sh, 16, 64, 9, 1, Activation::LeakyReLU);
+
+        let scale_exp = [scale_val[0].exp(), scale_val[1].exp(), scale_val[2].exp()];
+        let scale_mag = (scale_exp[0]*scale_exp[0] + scale_exp[1]*scale_exp[1] + scale_exp[2]*scale_exp[2]).sqrt() + 1e-8;
+        let scale_norm = [scale_exp[0] / scale_mag, scale_exp[1] / scale_mag, scale_exp[2] / scale_mag];
+
+        let rot_mag = (rot_val[0]*rot_val[0] + rot_val[1]*rot_val[1] + rot_val[2]*rot_val[2] + rot_val[3]*rot_val[3]).sqrt() + 1e-8;
+        let rot_norm = [rot_val[0] / rot_mag, rot_val[1] / rot_mag, rot_val[2] / rot_mag, rot_val[3] / rot_mag];
+
+        let mut shs_flat = [0.0f32; 12];
+        shs_flat[0..3].copy_from_slice(&dc_raw);
+        shs_flat[3..12].copy_from_slice(&sh_raw);
+        let mut shs_norm = [0.0f32; 12];
+        let shs_mag = shs_flat.iter().map(|&x| x * x).sum::<f32>().sqrt() + 1e-8;
+        for j in 0..12 {
+            shs_norm[j] = shs_flat[j] / shs_mag;
+        }
+
+        let act_opacity = sigmoid(opacity_raw[0]);
+        let mut shsnn_input = [0.0f32; 23];
+        shsnn_input[0..12].copy_from_slice(&shs_norm);
+        shsnn_input[12] = act_opacity;
+        shsnn_input[13..16].copy_from_slice(&scale_norm);
+        shsnn_input[16] = px;
+        shsnn_input[17] = py;
+        shsnn_input[18] = pz;
+        shsnn_input[19..23].copy_from_slice(&rot_norm);
+
+        let feat1 = run_pytorch_mlp(&shsnn_input, mlp_offset_w0, mlp_offset_b0, true);
+        let feat2 = run_pytorch_mlp(&feat1, mlp_offset_w1, mlp_offset_b1, true);
+        let feat3 = run_pytorch_mlp(&feat2, mlp_offset_w2, mlp_offset_b2, true);
+        let sh_offset = run_pytorch_mlp(&feat3, mlp_offset_w3, mlp_offset_b3, false);
+
+        dc_raw[0] += sh_offset[0];
+        dc_raw[1] += sh_offset[1];
+        dc_raw[2] += sh_offset[2];
+        for r in 0..3 {
+            sh_raw[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
+            sh_raw[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
+            sh_raw[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
+        }
+
+        let gsplat = Gsplat {
+            center: glam::Vec3::new(px, py, pz),
+            opacity: f16::from_f32(opacity_raw[0]),
+            rgb: [f16::from_f32(dc_raw[0]), f16::from_f32(dc_raw[1]), f16::from_f32(dc_raw[2])],
+            ln_scales: [f16::from_f32(scale_val[0]), f16::from_f32(scale_val[1]), f16::from_f32(scale_val[2])],
+            quaternion: [f16::from_f32(rot_val[0]), f16::from_f32(rot_val[1]), f16::from_f32(rot_val[2]), f16::from_f32(rot_val[3])],
+        };
+        gsplats.push(gsplat);
+
+        let mut sh1 = GsplatSH1::default();
+        let mut sh1_arr = [f16::from_f32(0.0); 9];
+        for k in 0..9 {
+            sh1_arr[k] = f16::from_f32(sh_raw[k]);
+        }
+        sh1.0 = [
+            [sh1_arr[0], sh1_arr[1], sh1_arr[2]],
+            [sh1_arr[3], sh1_arr[4], sh1_arr[5]],
+            [sh1_arr[6], sh1_arr[7], sh1_arr[8]],
+        ];
+        sh1_vec.push(sh1);
+    }
+
+    crate::GsplatArray::new(GsplatArrayInner {
+        max_sh_degree: 1,
+        splats: gsplats,
+        children: vec![smallvec::smallvec![]; num_points],
+        sh1: sh1_vec,
+        sh2: Vec::new(),
+        sh3: Vec::new(),
+    })
+}
+
+#[wasm_bindgen]
+pub fn stable_lexicographic_sort_wasm(xyz: &[f32]) -> Vec<usize> {
+    let num_points = xyz.len() / 3;
+    let mut points = Vec::with_capacity(num_points);
+    for i in 0..num_points {
+        points.push([xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]]);
+    }
+    spark_lib::sp5::stable_lexicographic_sort(&points)
 }

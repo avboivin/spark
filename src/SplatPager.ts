@@ -21,6 +21,7 @@ import {
   getTextureSize,
   unpackSplat,
   uploadU32DataTextureRows,
+  SplatCache,
 } from "./utils";
 import * as wasm from "./wasm";
 
@@ -30,8 +31,40 @@ export interface PagedSplatsOptions {
   requestHeader?: Record<string, string>;
   withCredentials?: boolean;
   fileBytes?: Uint8Array;
+  fileBlob?: Blob;
   fileType?: SplatFileType;
   maxSh?: number;
+}
+
+export interface ChunkSource {
+  read(offset?: number, bytes?: number): Promise<Uint8Array>;
+}
+
+export class HttpChunkSource implements ChunkSource {
+  constructor(
+    private url: string,
+    private requestHeader?: Record<string, string>,
+    private withCredentials?: boolean
+  ) {}
+  async read(offset?: number, bytes?: number): Promise<Uint8Array> {
+    return fetchRange({
+      url: this.url,
+      requestHeader: this.requestHeader,
+      withCredentials: this.withCredentials,
+      offset,
+      bytes,
+    });
+  }
+}
+
+export class BlobChunkSource implements ChunkSource {
+  constructor(private blob: Blob) {}
+  async read(offset?: number, bytes?: number): Promise<Uint8Array> {
+    const sliced = offset !== undefined && bytes !== undefined
+      ? this.blob.slice(offset, offset + bytes)
+      : this.blob;
+    return new Uint8Array(await sliced.arrayBuffer());
+  }
 }
 
 const PAGE_WIDTH = 256;
@@ -44,6 +77,8 @@ export class PagedSplats implements SplatSource {
   requestHeader?: Record<string, string>;
   withCredentials?: boolean;
   fileBytes?: Uint8Array;
+  fileBlob?: Blob;
+  chunkSource?: ChunkSource;
   fileType?: SplatFileType;
 
   numSh: number;
@@ -92,9 +127,16 @@ export class PagedSplats implements SplatSource {
     this.shMax = new dyno.DynoVec3({ value: new THREE.Vector3() });
 
     this.fileBytes = options.fileBytes;
+    this.fileBlob = options.fileBlob;
     this.fileType = options.fileType;
     if (!this.fileType && this.fileBytes) {
       this.fileType = getSplatFileType(this.fileBytes);
+    }
+    if (!this.fileType && this.fileBlob) {
+      const name = (this.fileBlob as any).name;
+      if (name) {
+        this.fileType = getSplatFileTypeFromPath(name);
+      }
     }
     if (!this.fileType && this.rootUrl) {
       this.fileType = getSplatFileTypeFromPath(this.rootUrl);
@@ -102,12 +144,34 @@ export class PagedSplats implements SplatSource {
     if (!this.fileType) {
       throw new Error("Unable to determine file type");
     }
+
+    if (this.fileBlob) {
+      this.chunkSource = new BlobChunkSource(this.fileBlob);
+    } else if (this.fileBytes) {
+      this.chunkSource = new BlobChunkSource(new Blob([this.fileBytes]));
+    } else if (this.rootUrl) {
+      this.chunkSource = new HttpChunkSource(
+        this.rootUrl,
+        this.requestHeader,
+        this.withCredentials
+      );
+    }
+
     if (this.fileType === SplatFileType.RAD) {
       this.radMetaPromise = this.getRadMeta();
+    }
+    if (this.fileType === SplatFileType.SP5 && this.pager) {
+      (this.pager as any).extSplats = true;
+    }
+    if (this.pager) {
+      this.pager.activeSplats.add(this);
     }
   }
 
   dispose() {
+    if (this.pager) {
+      this.pager.activeSplats.delete(this);
+    }
     if (this.dynoIndices.value !== SplatPager.emptyIndicesTexture) {
       this.dynoIndices.value.dispose();
       this.dynoIndices.value = SplatPager.emptyIndicesTexture;
@@ -126,28 +190,48 @@ export class PagedSplats implements SplatSource {
     this.radMetaPromise = (async () => {
       await wasm.initialization;
 
-      if (this.fileBytes) {
-        // Shouldn't be more than 1 MB, so don't send more data than that.
-        const metaStart = decode_rad_header(this.fileBytes.slice(0, 1048576));
-        if (metaStart) {
-          return metaStart;
-        }
-        throw new Error("Failed to decode RAD header");
-      }
-      if (!this.rootUrl) {
-        throw new Error("No url or fileBytes provided");
+      if (!this.chunkSource) {
+        throw new Error("No chunkSource available");
       }
 
-      // We don't know how big the header will be. Most likely 64KB will be enough,
-      // but try larger blocks in backoff if it wasn't enough.
+      if (this.fileType !== SplatFileType.RAD) {
+        const spotId = this.rootUrl || (this.fileBlob as any)?.name || (this.fileBytes as any)?.name || "local-drop";
+        const cacheKey = `local-drop-${spotId}-${(this.fileBlob as any)?.size || this.fileBytes?.length || 0}`;
+
+        const cachedManifest = await SplatCache.getManifest(cacheKey);
+        if (cachedManifest) {
+          this.rootUrl = cacheKey;
+          return { meta: cachedManifest, chunksStart: 0 };
+        }
+
+        const fileBytes = await this.chunkSource.read();
+        const result = (await workerPool.withWorker(async (worker) => {
+          return await worker.call("partitionDroppedMonolithic", {
+            fileBytes,
+            fileType: this.fileType,
+            pathName: spotId,
+            lodBase: this.pager?.maxSh ?? 1.5,
+          });
+        })) as { manifest: RadMeta; chunks: { chunk: number; bytes: Uint8Array; numSplats: number }[] };
+
+        await SplatCache.putManifest(cacheKey, result.manifest);
+        for (const chunk of result.chunks) {
+          await SplatCache.putChunk(
+            cacheKey,
+            chunk.chunk,
+            0,
+            chunk.bytes,
+            chunk.numSplats,
+            this.pager?.maxCacheSplats ?? 0,
+          );
+        }
+
+        this.rootUrl = cacheKey;
+        return { meta: result.manifest, chunksStart: 0 };
+      }
+
       for (const tryBytes of [65536, 256 * 1024, 1024 * 1024]) {
-        const bytes = await fetchRange({
-          url: this.rootUrl,
-          requestHeader: this.requestHeader,
-          withCredentials: this.withCredentials,
-          offset: 0,
-          bytes: tryBytes,
-        });
+        const bytes = await this.chunkSource.read(0, tryBytes);
         const metaStart = decode_rad_header(bytes);
         if (metaStart) {
           return metaStart;
@@ -155,14 +239,11 @@ export class PagedSplats implements SplatSource {
       }
       throw new Error("Failed to decode RAD header");
     })().then((metaStart) => {
-      // console.log("RAD meta: ", metaStart.meta);
       return metaStart;
     });
 
     this.radMetaPromise.catch((error) => {
       console.error(error);
-      // Allow it to be tried again
-      // this.radMetaPromise = undefined;
     });
 
     return this.radMetaPromise;
@@ -173,78 +254,71 @@ export class PagedSplats implements SplatSource {
   }
 
   async fetchDecodeChunk(chunk: number) {
-    let decodeBytes = undefined;
+    const spotId = this.rootUrl || (this.fileBlob as any)?.name || (this.fileBytes as any)?.name || "local-drop";
+    let decodeBytes = await SplatCache.getChunk(spotId, chunk);
+    const cacheHit = decodeBytes !== null;
 
-    if (this.fileType === SplatFileType.RAD) {
-      const { meta, chunksStart } = await this.getRadMeta();
-      if (chunk < 0 || chunk >= meta.chunks.length) {
-        throw new Error(
-          `Chunk index out of range: ${chunk} (max: ${meta.chunks.length - 1})`,
-        );
-      }
-      let { offset, bytes, filename } = meta.chunks[chunk];
-
-      if (filename) {
-        if (this.fileBytes) {
-          throw new Error("Chunked RAD file not supported with fileBytes");
+    if (!cacheHit) {
+      if (this.fileType === SplatFileType.RAD) {
+        const { meta, chunksStart } = await this.getRadMeta();
+        if (chunk < 0 || chunk >= meta.chunks.length) {
+          throw new Error(
+            `Chunk index out of range: ${chunk} (max: ${meta.chunks.length - 1})`,
+          );
         }
-        const resolvedRoot = new URL(
-          this.rootUrl,
-          window.location.href,
-        ).toString();
-        const chunkUrl = new URL(filename, resolvedRoot).toString();
-        decodeBytes = await fetchRange({
-          url: chunkUrl,
-          requestHeader: this.requestHeader,
-          withCredentials: this.withCredentials,
-        });
-      } else {
-        offset += chunksStart;
-        // console.log(`Fetching chunk ${chunk} at offset ${offset} with bytes ${bytes}`);
-        if (this.fileBytes) {
-          if (offset < 0 || offset + bytes > this.fileBytes.length) {
-            throw new Error(
-              `Invalid chunk offset or bytes: ${offset} + ${bytes} > ${this.fileBytes.length}`,
-            );
+        let { offset, bytes, filename } = meta.chunks[chunk];
+
+        if (filename) {
+          if (this.fileBytes) {
+            throw new Error("Chunked RAD file not supported with fileBytes");
           }
-          decodeBytes = this.fileBytes.slice(offset, offset + bytes);
-        } else if (this.rootUrl) {
+          const resolvedRoot = new URL(
+            this.rootUrl,
+            window.location.href,
+          ).toString();
+          const chunkUrl = new URL(filename, resolvedRoot).toString();
           decodeBytes = await fetchRange({
-            url: this.rootUrl,
+            url: chunkUrl,
             requestHeader: this.requestHeader,
             withCredentials: this.withCredentials,
-            offset,
-            bytes,
           });
         } else {
-          throw new Error("No url or fileBytes provided");
+          offset += chunksStart;
+          if (this.chunkSource) {
+            decodeBytes = await this.chunkSource.read(offset, bytes);
+          } else {
+            throw new Error("No chunkSource available");
+          }
         }
+      } else if (this.fileBytes) {
+        // Fall through
+      } else if (this.rootUrl) {
+        const url = this.chunkUrl(chunk);
+        const request = new Request(url, {
+          headers: this.requestHeader
+            ? new Headers(this.requestHeader)
+            : undefined,
+          credentials: this.withCredentials ? "include" : "same-origin",
+        });
+        const response = await fetch(request);
+        if (!response.ok || !response.body) {
+          throw new Error(
+            `Failed to fetch "${url}": ${response.status} ${response.statusText}`,
+          );
+        }
+        decodeBytes = new Uint8Array(await response.arrayBuffer());
+      } else if (this.chunkSource) {
+        decodeBytes = await this.chunkSource.read();
+      } else {
+        throw new Error("No url or fileBytes provided");
       }
-    } else if (this.fileBytes) {
-      // Fall through
-    } else if (this.rootUrl) {
-      const url = this.chunkUrl(chunk);
-      const request = new Request(url, {
-        headers: this.requestHeader
-          ? new Headers(this.requestHeader)
-          : undefined,
-        credentials: this.withCredentials ? "include" : "same-origin",
-      });
-      const response = await fetch(request);
-      if (!response.ok || !response.body) {
-        throw new Error(
-          `Failed to fetch "${url}": ${response.status} ${response.statusText}`,
-        );
-      }
-      decodeBytes = new Uint8Array(await response.arrayBuffer());
-    } else {
-      throw new Error("No url or fileBytes provided");
     }
 
     return await workerPool.withWorker(async (worker) => {
       if (!this.pager) {
         throw new Error("PagedSplats.pager not set");
       }
+      let lodSplats: PackedResult | ExtResult;
       if (!this.pager.extSplats) {
         const result = (await worker.call("loadPackedSplats", {
           fileBytes: decodeBytes,
@@ -253,7 +327,7 @@ export class PagedSplats implements SplatSource {
           sh2Codes: this.sh2Codes?.slice(),
           sh3Codes: this.sh3Codes?.slice(),
         })) as { lodSplats: PackedResult };
-        const lodSplats = result.lodSplats;
+        lodSplats = result.lodSplats;
         if (!this.splatEncoding) {
           this.splatEncoding = lodSplats.splatEncoding;
 
@@ -283,34 +357,64 @@ export class PagedSplats implements SplatSource {
         this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
         this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
         this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
-        return lodSplats;
+      } else if (this.fileType === SplatFileType.SP5) {
+        const result = (await worker.call("decodeSp5Chunk", {
+          chunkBytes: decodeBytes,
+        })) as ExtResult;
+        lodSplats = result;
+        if (!this.splatEncoding) {
+          this.splatEncoding = DEFAULT_SPLAT_ENCODING;
+          this.numSh =
+            lodSplats.extra.sh3a && lodSplats.extra.sh3b
+              ? 3
+              : lodSplats.extra.sh2
+                ? 2
+                : lodSplats.extra.sh1
+                  ? 1
+                  : 0;
+        }
+        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
+        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
+        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
+      } else {
+        const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
+        const result = (await worker.call("loadExtSplats", {
+          fileBytes: decodeBytes,
+          pathName: this.chunkUrl(chunk),
+          sh1Codes: this.sh1Codes?.slice(),
+          sh2Codes: this.sh2Codes?.slice(),
+          sh3Codes: sh3Codes
+            ? [sh3Codes[0].slice(), sh3Codes[1].slice()]
+            : undefined,
+        })) as { lodSplats: ExtResult };
+        lodSplats = result.lodSplats;
+        if (!this.splatEncoding) {
+          this.splatEncoding = DEFAULT_SPLAT_ENCODING;
+          this.numSh =
+            lodSplats.extra.sh3a && lodSplats.extra.sh3b
+              ? 3
+              : lodSplats.extra.sh2
+                ? 2
+                : lodSplats.extra.sh1
+                  ? 1
+                  : 0;
+        }
+        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
+        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
+        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
       }
 
-      const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
-      const result = (await worker.call("loadExtSplats", {
-        fileBytes: decodeBytes,
-        pathName: this.chunkUrl(chunk),
-        sh1Codes: this.sh1Codes?.slice(),
-        sh2Codes: this.sh2Codes?.slice(),
-        sh3Codes: sh3Codes
-          ? [sh3Codes[0].slice(), sh3Codes[1].slice()]
-          : undefined,
-      })) as { lodSplats: ExtResult };
-      const lodSplats = result.lodSplats;
-      if (!this.splatEncoding) {
-        this.splatEncoding = DEFAULT_SPLAT_ENCODING;
-        this.numSh =
-          lodSplats.extra.sh3a && lodSplats.extra.sh3b
-            ? 3
-            : lodSplats.extra.sh2
-              ? 2
-              : lodSplats.extra.sh1
-                ? 1
-                : 0;
+      if (!cacheHit && decodeBytes) {
+        await SplatCache.putChunk(
+          spotId,
+          chunk,
+          0,
+          decodeBytes,
+          lodSplats.numSplats,
+          this.pager.maxCacheSplats
+        );
       }
-      this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-      this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-      this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
+
       return lodSplats;
     });
   }
@@ -497,10 +601,19 @@ export interface SplatPagerOptions {
    */
   autoDrive?: boolean;
   /**
-   * Number of parallel chunk fetchers
+   * Number of concurrent fetchers
    * @default 3
    */
   numFetchers?: number;
+  /**
+   * Maximum size of IndexedDB cache in splats
+   */
+  maxCacheSplats?: number;
+  /**
+   * Proactively fetch and cache chunks in the background
+   * @default false
+   */
+  backgroundPrefetch?: boolean;
 }
 
 interface PageUpload {
@@ -518,6 +631,9 @@ export class SplatPager {
   readonly maxPages: number;
   readonly maxSplats: number;
   readonly pageSplats: number;
+  readonly maxCacheSplats: number;
+  backgroundPrefetch: boolean;
+  activeSplats: Set<PagedSplats> = new Set();
 
   readonly maxSh: number;
   curSh: number;
@@ -603,6 +719,9 @@ export class SplatPager {
     this.maxSplats = options.maxSplats ?? 16777216;
     this.maxPages = Math.ceil(this.maxSplats / PAGE_SPLATS);
     this.maxSplats = this.maxPages * PAGE_SPLATS;
+
+    this.maxCacheSplats = options.maxCacheSplats ?? this.maxSplats;
+    this.backgroundPrefetch = options.backgroundPrefetch ?? false;
 
     this.maxSh = options.maxSh ?? 3;
     this.curSh = 0;
@@ -1088,6 +1207,10 @@ export class SplatPager {
       }
     }
 
+    if (this.backgroundPrefetch && this.fetchers.length < this.numFetchers) {
+      this.runBackgroundPrefetch();
+    }
+
     // Update LRU ordering in reverse priority order
     const now = performance.now();
 
@@ -1107,6 +1230,99 @@ export class SplatPager {
       this.pageLru.add(pageLru);
     }
     this.freeablePages = Array.from(extraPages).map(({ page }) => page);
+  }
+
+  private async runBackgroundPrefetch() {
+    for (const splats of this.activeSplats) {
+      if (this.fetchers.length >= this.numFetchers) return;
+
+      if (splats.fileType === SplatFileType.RAD) {
+        let meta;
+        try {
+          const radMeta = await splats.getRadMeta();
+          meta = radMeta.meta;
+        } catch (e) {
+          continue;
+        }
+
+        const spotId = splats.rootUrl || (splats.fileBlob as any)?.name || (splats.fileBytes as any)?.name || "local-drop";
+        for (let chunk = 0; chunk < meta.chunks.length; chunk++) {
+          if (this.fetchers.length >= this.numFetchers) return;
+
+          // Check if already in priority list, fetching, or fetched
+          if (this.fetchPriority.some((p) => p.splats === splats && p.chunk === chunk)) continue;
+          if (this.fetchers.some((p) => p.splats === splats && p.chunk === chunk)) continue;
+          if (this.fetched.some((p) => p.splats === splats && p.chunk === chunk)) continue;
+          if (this.splatsChunkToPage.get(splats)?.[chunk]) continue;
+
+          // Query cache
+          const cached = await SplatCache.getChunk(spotId, chunk);
+          if (cached !== null) continue; // Already in cache!
+
+          // Fetch and cache in background!
+          this.prefetchChunk(splats, chunk, spotId, meta.chunks[chunk].count || 0);
+        }
+      }
+    }
+  }
+
+  private async prefetchChunk(
+    splats: PagedSplats,
+    chunk: number,
+    spotId: string,
+    numSplats: number,
+  ) {
+    const promise = (async () => {
+      try {
+        let bytes: Uint8Array;
+        if (splats.fileType === SplatFileType.RAD) {
+          const { meta, chunksStart } = await splats.getRadMeta();
+          const { offset, bytes: byteCount, filename } = meta.chunks[chunk];
+          if (filename) {
+            const resolvedRoot = new URL(splats.rootUrl, window.location.href).toString();
+            const chunkUrl = new URL(filename, resolvedRoot).toString();
+            bytes = await fetchRange({
+              url: chunkUrl,
+              requestHeader: splats.requestHeader,
+              withCredentials: splats.withCredentials,
+            });
+          } else {
+            if (splats.chunkSource) {
+              bytes = await splats.chunkSource.read(offset + chunksStart, byteCount);
+            } else {
+              return;
+            }
+          }
+        } else {
+          const url = splats.chunkUrl(chunk);
+          const response = await fetch(url, {
+            headers: splats.requestHeader ? new Headers(splats.requestHeader) : undefined,
+            credentials: splats.withCredentials ? "include" : "same-origin",
+          });
+          bytes = new Uint8Array(await response.arrayBuffer());
+        }
+
+        await SplatCache.putChunk(
+          spotId,
+          chunk,
+          0,
+          bytes,
+          numSplats,
+          this.maxCacheSplats,
+        );
+      } catch (err) {
+        console.warn("Background prefetch failed for chunk", chunk, err);
+      }
+    })().finally(() => {
+      this.fetchers = this.fetchers.filter(
+        (f) => f.splats !== splats || f.chunk !== chunk,
+      );
+      if (this.autoDrive) {
+        this.driveFetchers();
+      }
+    });
+
+    this.fetchers.push({ splats, chunk, promise });
   }
 
   private allocateFreeable(): number | undefined {

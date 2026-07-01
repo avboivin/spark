@@ -8,6 +8,7 @@ pub mod tiny_lod;
 pub mod bhatt_lod;
 pub mod ply;
 pub mod spz;
+pub mod sp5;
 pub mod antisplat;
 pub mod ksplat;
 pub mod sogs;

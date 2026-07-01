@@ -432,6 +432,9 @@ export function getSplatFileType(
   if (magic === 0x30444152) {
     return SplatFileType.RAD;
   }
+  if (magic === 0x355a5053) {
+    return SplatFileType.SP5;
+  }
   // Unknown file type
   return undefined;
 }
@@ -472,6 +475,9 @@ export function getSplatFileTypeFromPath(
   }
   if (extension === "rad") {
     return SplatFileType.RAD;
+  }
+  if (extension === "sp5") {
+    return SplatFileType.SP5;
   }
   return undefined;
 }

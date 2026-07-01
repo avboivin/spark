@@ -50,6 +50,7 @@ export enum SplatFileType {
   PCSOGS = "pcsogs",
   PCSOGSZIP = "pcsogszip",
   RAD = "rad",
+  SP5 = "sp5",
 }
 
 export type SplatEncoding = {

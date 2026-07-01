@@ -185,7 +185,7 @@
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SparkRenderer, SplatMesh, transcodeSpz, SparkControls } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh, SplatPager, transcodeSpz, SparkControls } from "@sparkjsdev/spark";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
     const sparkCanvasEl = document.querySelector(".spark-canvas");
@@ -270,9 +270,20 @@
     };
 
     async function loadSplatFile(splatFile) {
-      fileBytes = new Uint8Array(await splatFile.arrayBuffer());
+      const maxCacheSplats = parseInt(document.querySelector('#max-cache-splats')?.value || "16777216");
+      const backgroundPrefetch = document.querySelector('#background-prefetch')?.checked || false;
+
       fileName = splatFile.name;
-      setSplatFile({ fileBytes: fileBytes.slice(), fileName });
+      setSplatFile({
+        fileBlob: splatFile,
+        fileName,
+        paged: true,
+        pager: new SplatPager({
+          renderer: renderer,
+          maxCacheSplats,
+          backgroundPrefetch
+        })
+      });
     }
 
     var loadedSplat;
@@ -357,6 +368,16 @@
       <form class="url-form">
         <input class="url-input" type="text" placeholder="Copy splat URL" />
       </form>
+      <div style="margin-top: 20px; font-family: system-ui, sans-serif; font-size: 0.9em; display: flex; flex-direction: column; gap: 8px; color: #ccc; align-items: center;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+          <input id="background-prefetch" type="checkbox" style="cursor: pointer;" />
+          Background Prefetch
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px;">
+          Max Cache Splats:
+          <input id="max-cache-splats" type="number" value="16777216" style="background: #222; border: 1px solid #444; color: #fff; padding: 4px; border-radius: 4px; width: 120px; font-family: monospace;" />
+        </label>
+      </div>
     </div>
   </div>
 </body>

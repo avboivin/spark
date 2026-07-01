@@ -2,7 +2,8 @@ import { TranscodeSpzInput } from './SplatLoader';
 import { GunzipReader } from './utils';
 export declare class SpzReader {
     fileBytes: Uint8Array;
-    reader: GunzipReader;
+    reader: GunzipReader | null;
+    v4Streams: Uint8Array[] | null;
     version: number;
     numSplats: number;
     shDegree: number;
@@ -17,17 +18,22 @@ export declare class SpzReader {
         fileBytes: Uint8Array | ArrayBuffer;
     });
     parseHeader(): Promise<void>;
+    private _loadV4Streams;
     parseSplats(centerCallback?: (index: number, x: number, y: number, z: number) => void, alphaCallback?: (index: number, alpha: number) => void, rgbCallback?: (index: number, r: number, g: number, b: number) => void, scalesCallback?: (index: number, scaleX: number, scaleY: number, scaleZ: number) => void, quatCallback?: (index: number, quatX: number, quatY: number, quatZ: number, quatW: number) => void, shCallback?: (index: number, sh1: Float32Array, sh2?: Float32Array, sh3?: Float32Array) => void, { childCounts, childStarts, }?: {
         childCounts?: (index: number, count: number) => void;
         childStarts?: (index: number, start: number) => void;
     }): Promise<void>;
 }
 export declare const SPZ_MAGIC = 1347635022;
-export declare const SPZ_VERSION = 3;
+export declare const SPZ_VERSION = 4;
 export declare const FLAG_ANTIALIASED = 1;
 export declare class SpzWriter {
-    buffer: ArrayBuffer;
-    view: DataView;
+    positions: Uint8Array;
+    alphas: Uint8Array;
+    colors: Uint8Array;
+    scales: Uint8Array;
+    rotations: Uint8Array;
+    sh: Uint8Array;
     numSplats: number;
     shDegree: number;
     fractionalBits: number;

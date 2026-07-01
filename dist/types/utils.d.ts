@@ -203,4 +203,17 @@ export declare class GunzipReader {
     });
     read(numBytes: number): Promise<Uint8Array>;
 }
+export declare class SplatCache {
+    private static DB_NAME;
+    private static DB_VERSION;
+    private static db;
+    static getDB(): Promise<IDBDatabase>;
+    static getManifest(spotId: string): Promise<any | null>;
+    static putManifest(spotId: string, manifest: any): Promise<void>;
+    static getChunk(spotId: string, chunkIndex: number): Promise<Uint8Array | null>;
+    static putChunk(spotId: string, chunkIndex: number, lod: number, spzBytes: Uint8Array, numSplats: number, maxCacheSplats: number): Promise<void>;
+    private static enforceEviction;
+    private static getTotalCachedSplats;
+}
+export declare function uploadU32DataTextureRows(renderer: THREE.WebGLRenderer, texture: THREE.Texture, width: number, rows: number, data: Uint32Array): void;
 export {};

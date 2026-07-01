@@ -124,6 +124,7 @@ impl<'a> TsplatMut for CsplatRefMut<'a> {
     fn set_quaternion(&mut self, quaternion: Quat) { set_quaternion(self.splat, quaternion); }
 }
 
+#[derive(Clone)]
 pub struct CsplatArray {
     pub encoding: Option<SplatEncoding>,
     pub max_sh_degree: usize,

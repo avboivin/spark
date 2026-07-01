@@ -1677,6 +1677,179 @@ export class GunzipReader {
   }
 }
 
+export class SplatCache {
+  private static DB_NAME = "SparkSplatCache";
+  private static DB_VERSION = 1;
+  private static db: IDBDatabase | null = null;
+
+  static async getDB(): Promise<IDBDatabase> {
+    if (this.db) return this.db;
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(this.DB_NAME, this.DB_VERSION);
+      request.onupgradeneeded = (e) => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains("manifests")) {
+          db.createObjectStore("manifests", { keyPath: "spotId" });
+        }
+        if (!db.objectStoreNames.contains("chunks")) {
+          const store = db.createObjectStore("chunks", { keyPath: ["spotId", "chunkIndex"] });
+          store.createIndex("lastAccessedAt", "lastAccessedAt", { unique: false });
+        }
+      };
+      request.onsuccess = () => {
+        this.db = request.result;
+        resolve(this.db);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  static async getManifest(spotId: string): Promise<any | null> {
+    try {
+      const db = await this.getDB();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction("manifests", "readonly");
+        const store = transaction.objectStore("manifests");
+        const request = store.get(spotId);
+        request.onsuccess = () => {
+          if (request.result) {
+            resolve(request.result.manifest);
+          } else {
+            resolve(null);
+          }
+        };
+        request.onerror = () => reject(request.error);
+      });
+    } catch (err) {
+      console.warn("SplatCache.getManifest failed:", err);
+      return null;
+    }
+  }
+
+  static async putManifest(spotId: string, manifest: any): Promise<void> {
+    try {
+      const db = await this.getDB();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction("manifests", "readwrite");
+        const store = transaction.objectStore("manifests");
+        const request = store.put({
+          spotId,
+          manifest,
+          cachedAt: Date.now()
+        });
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+    } catch (err) {
+      console.warn("SplatCache.putManifest failed:", err);
+    }
+  }
+
+  static async getChunk(spotId: string, chunkIndex: number): Promise<Uint8Array | null> {
+    try {
+      const db = await this.getDB();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction("chunks", "readwrite");
+        const store = transaction.objectStore("chunks");
+        const request = store.get([spotId, chunkIndex]);
+        request.onsuccess = () => {
+          const record = request.result;
+          if (record) {
+            record.lastAccessedAt = Date.now();
+            store.put(record);
+            resolve(record.spzBytes);
+          } else {
+            resolve(null);
+          }
+        };
+        request.onerror = () => reject(request.error);
+      });
+    } catch (err) {
+      console.warn("SplatCache.getChunk failed:", err);
+      return null;
+    }
+  }
+
+  static async putChunk(
+    spotId: string,
+    chunkIndex: number,
+    lod: number,
+    spzBytes: Uint8Array,
+    numSplats: number,
+    maxCacheSplats: number
+  ): Promise<void> {
+    try {
+      const db = await this.getDB();
+      if (maxCacheSplats > 0) {
+        await this.enforceEviction(db, numSplats, maxCacheSplats);
+      }
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction("chunks", "readwrite");
+        const store = transaction.objectStore("chunks");
+        const request = store.put({
+          spotId,
+          chunkIndex,
+          lod,
+          spzBytes,
+          byteLength: spzBytes.byteLength,
+          numSplats,
+          cachedAt: Date.now(),
+          lastAccessedAt: Date.now()
+        });
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+    } catch (err) {
+      console.warn("SplatCache.putChunk failed:", err);
+    }
+  }
+
+  private static async enforceEviction(db: IDBDatabase, incomingSplats: number, maxCacheSplats: number): Promise<void> {
+    let totalSplats = await this.getTotalCachedSplats(db);
+    if (totalSplats + incomingSplats <= maxCacheSplats) {
+      return;
+    }
+    return new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction("chunks", "readwrite");
+      const store = transaction.objectStore("chunks");
+      const index = store.index("lastAccessedAt");
+      const request = index.openCursor(null, "next");
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor && totalSplats + incomingSplats > maxCacheSplats) {
+          const record = cursor.value;
+          totalSplats -= record.numSplats || 0;
+          cursor.delete();
+          cursor.continue();
+        } else {
+          resolve();
+        }
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  private static async getTotalCachedSplats(db: IDBDatabase): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction("chunks", "readonly");
+      const store = transaction.objectStore("chunks");
+      const request = store.openCursor();
+      let total = 0;
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          total += cursor.value.numSplats || 0;
+          cursor.continue();
+        } else {
+          resolve(total);
+        }
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+}
+
+
 export function uploadU32DataTextureRows(
   renderer: THREE.WebGLRenderer,
   texture: THREE.Texture,

@@ -224,6 +224,7 @@ impl GsplatSH3 {
 //     }
 // }
 
+#[derive(Clone)]
 pub struct GsplatArray {
     pub max_sh_degree: usize,
     pub splats: Vec<Gsplat>,

@@ -335,6 +335,7 @@ pub enum SplatFileType {
     KSPLAT,
     SOGS,
     RAD,
+    SP5,
 }
 
 impl SplatFileType {
@@ -346,6 +347,7 @@ impl SplatFileType {
             Self::KSPLAT => "ksplat",
             Self::SOGS => "pcsogszip",
             Self::RAD => "rad",
+            Self::SP5 => "sp5",
         }
     }
 
@@ -357,6 +359,7 @@ impl SplatFileType {
             "ksplat" => Ok(Self::KSPLAT),
             "pcsogszip" => Ok(Self::SOGS),
             "rad" => Ok(Self::RAD),
+            "sp5" => Ok(Self::SP5),
             _ => Err(anyhow::anyhow!("Invalid file type: {}", enum_str)),
         }
     }
@@ -371,6 +374,7 @@ impl SplatFileType {
             "sogs" => Some(Self::SOGS),
             "zip" => Some(Self::SOGS),
             "rad" => Some(Self::RAD),
+            "sp5" => Some(Self::SP5),
             _ => None,
         }
     }
@@ -442,6 +446,10 @@ impl<T: SplatReceiver> MultiDecoder<T> {
             Ok(rad) => { return rad.into_splats(); },
             Err(inner_any) => inner_any,
         };
+        let inner_any = match inner_any.downcast::<Sp5Decoder<T>>() {
+            Ok(sp5) => { return sp5.into_splats(); },
+            Err(inner_any) => inner_any,
+        };
         let _ = inner_any;
         panic!("Invalid decoder type");
     }
@@ -477,6 +485,10 @@ impl<T: SplatReceiver> ChunkReceiver for MultiDecoder<T> {
             if magic == SPZ_MAGIC {
                 // NGSP magic at file start — SPZ v4 (ZSTD multi-stream, not gzip-wrapped)
                 return self.init_file_type(SplatFileType::SPZ);
+            }
+            const SP5_MAGIC: u32 = 0x355a5053; // "SPZ5" in little-endian
+            if magic == SP5_MAGIC {
+                return self.init_file_type(SplatFileType::SP5);
             }
             if (magic & 0x00ffffff) == GZIP_MAGIC {
                 // Gzipped file, unpack beginning to check magic number
@@ -538,6 +550,31 @@ fn new_decoder<T: SplatReceiver>(file_type: SplatFileType, splats: T) -> Box<dyn
         SplatFileType::KSPLAT => Box::new(KsplatDecoder::new(splats)),
         SplatFileType::SOGS => Box::new(SogsDecoder::new(splats, None)),
         SplatFileType::RAD => Box::new(RadDecoder::new(splats)),
+        SplatFileType::SP5 => Box::new(Sp5Decoder::new(splats)),
+    }
+}
+
+pub struct Sp5Decoder<T: SplatReceiver> {
+    splats: T,
+    buffer: Vec<u8>,
+}
+
+impl<T: SplatReceiver> Sp5Decoder<T> {
+    pub fn new(splats: T) -> Self {
+        Self { splats, buffer: Vec::new() }
+    }
+    pub fn into_splats(self) -> T {
+        self.splats
+    }
+}
+
+impl<T: SplatReceiver> ChunkReceiver for Sp5Decoder<T> {
+    fn push(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("Monolithic .sp5 decoding is not supported. Use SplatPager/manifest.json."))
     }
 }
 
