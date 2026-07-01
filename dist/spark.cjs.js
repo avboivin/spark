@@ -11637,7 +11637,7 @@ class PagedSplats {
           sh2Codes: (_b3 = this.sh2Codes) == null ? void 0 : _b3.slice(),
           sh3Codes: (_c = this.sh3Codes) == null ? void 0 : _c.slice()
         });
-        lodSplats = result.lodSplats;
+        lodSplats = result.lodSplats ? result.lodSplats : result;
       }
       if (this.fileType === SplatFileType.SP5 || !this.pager.extSplats) {
         const packed = lodSplats;
@@ -11669,14 +11669,15 @@ class PagedSplats {
           sh2Codes: (_e = this.sh2Codes) == null ? void 0 : _e.slice(),
           sh3Codes: sh3Codes ? [sh3Codes[0].slice(), sh3Codes[1].slice()] : void 0
         });
-        lodSplats = result.lodSplats;
+        lodSplats = result.lodSplats ? result.lodSplats : result;
+        const ext = lodSplats;
         if (!this.splatEncoding) {
           this.splatEncoding = DEFAULT_SPLAT_ENCODING;
-          this.numSh = lodSplats.extra.sh3a && lodSplats.extra.sh3b ? 3 : lodSplats.extra.sh2 ? 2 : lodSplats.extra.sh1 ? 1 : 0;
+          this.numSh = ext.extra.sh3a && ext.extra.sh3b ? 3 : ext.extra.sh2 ? 2 : ext.extra.sh1 ? 1 : 0;
         }
-        this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
-        this.sh2Codes = lodSplats.extra.sh2Codes ?? this.sh2Codes;
-        this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
+        this.sh1Codes = ext.extra.sh1Codes ?? this.sh1Codes;
+        this.sh2Codes = ext.extra.sh2Codes ?? this.sh2Codes;
+        this.sh3Codes = ext.extra.sh3Codes ?? this.sh3Codes;
       }
       if (!cacheHit && decodeBytes) {
         await SplatCache.putChunk(
