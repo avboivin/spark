@@ -45,6 +45,12 @@
       left: 0;
       width: 100vw;
       height: 100vh;
+      /* Debug aid: always-visible border so an empty/black viewer is distinguishable
+         from a viewer that isn't rendering at all (wrong size, not mounted, etc).
+         If you see this border with nothing but black inside it, the canvas itself
+         is fine and the problem is upstream (no geometry uploaded, camera pointed
+         at nothing, etc) -- see console logs prefixed [camera-fit]. */
+      border: 6px solid #ff00ff;
     }
 
     .invisible {
@@ -191,6 +197,9 @@
     const sparkCanvasEl = document.querySelector(".spark-canvas");
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 1000);
+    // near/far are widened dynamically in fitCameraToBoundingBox() once the real
+    // scene extent is known -- see the comment there for why the fixed far=1000
+    // above is only a placeholder before the first fit.
     camera.position.set(0, 0, 1);
     const renderer = new THREE.WebGLRenderer({canvas: sparkCanvasEl});
     const width = sparkCanvasEl.clientWidth;
@@ -207,6 +216,20 @@
     // orbitControls.target.set(0, 0, 0);
     // orbitControls.minDistance = 0.1;
     // orbitControls.maxDistance = 10;
+
+    // SparkControls' scroll/move/slide speeds are fixed absolute constants
+    // (defaults tuned for a scene roughly 1 unit across). Rather than a single
+    // flat multiplier -- which is either imperceptibly slow far from the
+    // content or wildly overshoots close to it -- rescale every frame by the
+    // camera's CURRENT distance to the loaded scene's center, the same way
+    // exponential/distance-based dolly works in most 3D viewers (e.g.
+    // OrbitControls): big steps while far away, fine steps once close.
+    const sceneFocus = new THREE.Vector3();
+    let sceneFocusValid = false;
+    // Widest extent of the loaded scene (from computeRobustBox), used so the
+    // far plane stays big enough to never clip legitimate content regardless
+    // of how close the camera currently is.
+    let sceneMaxDim = 1;
 
     function resize() {
       const width = window.innerWidth;
@@ -230,6 +253,30 @@
     renderer.setAnimationLoop(function animate(time) {
       resize();
       // orbitControls.update();
+      if (sceneFocusValid) {
+        const dist = Math.max(camera.position.distanceTo(sceneFocus), 1e-3);
+        controls.pointerControls.scrollSpeed = 0.0015 * dist;
+        controls.pointerControls.slideSpeed = 0.006 * dist;
+        controls.fpsMovement.moveSpeed = 1.0 * dist;
+
+        // near/far were only ever set ONCE, at the initial (far-away) camera
+        // fit. For a georeferenced scene where the auto-fit framed a wide area
+        // (building + surrounding terrain), driving the camera in close to
+        // inspect detail meant `near` stayed sized for the original far-away
+        // distance -- e.g. fit distance 50000 -> near=50, which is bigger than
+        // an entire small building, so approaching it clipped the whole thing
+        // away with no warning ("clips-through and disappears"). Recompute
+        // near/far from the camera's CURRENT distance every frame instead, so
+        // near always shrinks as you approach and far always stays big enough
+        // to reach back out to the full scene extent.
+        const newNear = Math.max(dist / 1000, 1e-4);
+        const newFar = dist + sceneMaxDim * 2 + 1;
+        if (Math.abs(camera.near - newNear) > newNear * 0.05 || Math.abs(camera.far - newFar) > newFar * 0.05) {
+          camera.near = newNear;
+          camera.far = newFar;
+          camera.updateProjectionMatrix();
+        }
+      }
       controls.update(camera);
       renderer.render(scene, camera);
     });
@@ -269,29 +316,203 @@
       loadSplatFile(event.target.files[0]);
     };
 
-    function onSplatLoad(mesh) {
-      console.log("SplatMesh loaded!");
-      try {
-        const box = mesh.getBoundingBox();
-        const center = new THREE.Vector3();
-        box.getCenter(center);
-        const size = new THREE.Vector3();
-        box.getSize(size);
-        
-        console.log("SplatMesh bounding box center:", center, "size:", size);
-        
-        // Adjust camera position
-        const maxDim = Math.max(size.x, size.y, size.z);
-        const fov = camera.fov * (Math.PI / 180);
-        let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-        cameraZ *= 1.5; // zoom out a bit to fit comfortably
-        
-        // Position camera to look at center
-        camera.position.set(center.x, center.y, center.z + cameraZ);
-        camera.lookAt(center);
-      } catch (e) {
-        console.error("Error centering camera:", e);
+    // Root cause of the "black screen" bug: `onLoad` fires as soon as the SplatMesh's
+    // async setup (manifest parsing, pager wiring) resolves -- NOT once actual chunk
+    // geometry has streamed in and uploaded to the GPU. For a paged/chunked mesh those
+    // are different moments: geometry pages upload progressively afterward, driven by
+    // the render loop. Fitting the camera to `getBoundingBox()` at `onLoad` time reads a
+    // legitimately-empty (0,0,0)-sized box, which parks the camera at the origin looking
+    // at the origin -- permanently, since nothing ever re-triggers a re-fit once real
+    // geometry does arrive a moment later. Fix: poll the bounding box until it's actually
+    // non-degenerate (or give up after a timeout and say so loudly), then fit the camera.
+    // Photogrammetry scenes contain rare "floater" outlier splats (this dataset
+    // reaches +/-175000 while 99.9% of splats sit within +/-5500). Those outliers
+    // are clamped into f16 range at pack time so they no longer produce Infinity,
+    // but a raw min/max bounding box would still frame the camera around them,
+    // shrinking the real content to an invisible speck. Compute a robust box from
+    // per-axis percentiles instead, so the camera frames the bulk of the scene and
+    // ignores the handful of floaters sitting at the clamp boundary.
+    function computeRobustBox(mesh, loPct = 0.5, hiPct = 99.5) {
+      const cap = Math.max(1, mesh.numSplats ?? 0);
+      const xs = new Float32Array(cap);
+      const ys = new Float32Array(cap);
+      const zs = new Float32Array(cap);
+      let count = 0;
+      mesh.forEachSplat((_i, center) => {
+        if (count >= cap) return;
+        if (Number.isFinite(center.x) && Number.isFinite(center.y) && Number.isFinite(center.z)) {
+          xs[count] = center.x; ys[count] = center.y; zs[count] = center.z; count++;
+        }
+      });
+      if (count === 0) return null;
+      const pct = (arr, p) => {
+        const a = arr.subarray(0, count);
+        a.sort();
+        const idx = Math.min(count - 1, Math.max(0, Math.round((p / 100) * (count - 1))));
+        return a[idx];
+      };
+      return new THREE.Box3(
+        new THREE.Vector3(pct(xs, loPct), pct(ys, loPct), pct(zs, loPct)),
+        new THREE.Vector3(pct(xs, hiPct), pct(ys, hiPct), pct(zs, hiPct)),
+      );
+    }
+
+    // Any FIXED percentile cutoff (even a tight one) is the wrong tool for
+    // georeferenced captures like a drone/photogrammetry building scan: the
+    // real subject (a building) is a small, DENSE cluster of points, while
+    // the rest of the capture (surrounding terrain/context) is a much larger
+    // volume of SPARSE points. A percentile window sized to include even 90%
+    // of points by COUNT can still span a volume 100x+ larger than the dense
+    // subject, because a small fraction of points spread over a huge sparse
+    // area drags the percentile bounds out with them -- this is exactly why
+    // p5-p95 still framed a real 60x20m building at a ~1km camera distance.
+    // Instead, per axis, find the SHORTEST interval containing a majority of
+    // points (a standard robust "highest density interval" estimate, via a
+    // sliding window over the sorted values) -- this locks onto wherever
+    // points are actually concentrated, regardless of how far a sparse tail
+    // spreads beyond it.
+    function shortestIntervalContaining(sortedArr, count, fraction) {
+      const windowCount = Math.max(1, Math.min(count, Math.ceil(fraction * count)));
+      let bestWidth = Infinity;
+      let bestLo = 0;
+      for (let i = 0; i + windowCount - 1 < count; i++) {
+        const j = i + windowCount - 1;
+        const width = sortedArr[j] - sortedArr[i];
+        if (width < bestWidth) { bestWidth = width; bestLo = i; }
       }
+      return [sortedArr[bestLo], sortedArr[bestLo + windowCount - 1]];
+    }
+
+    function computeDensityBox(mesh, fraction = 0.5) {
+      const cap = Math.max(1, mesh.numSplats ?? 0);
+      const xs = new Float32Array(cap);
+      const ys = new Float32Array(cap);
+      const zs = new Float32Array(cap);
+      let count = 0;
+      mesh.forEachSplat((_i, center) => {
+        if (count >= cap) return;
+        if (Number.isFinite(center.x) && Number.isFinite(center.y) && Number.isFinite(center.z)) {
+          xs[count] = center.x; ys[count] = center.y; zs[count] = center.z; count++;
+        }
+      });
+      if (count === 0) return null;
+      const xa = xs.subarray(0, count); xa.sort();
+      const ya = ys.subarray(0, count); ya.sort();
+      const za = zs.subarray(0, count); za.sort();
+      const [x0, x1] = shortestIntervalContaining(xa, count, fraction);
+      const [y0, y1] = shortestIntervalContaining(ya, count, fraction);
+      const [z0, z1] = shortestIntervalContaining(za, count, fraction);
+      return new THREE.Box3(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
+    }
+
+    function fitCameraToBoundingBox(box, label, farBox) {
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      // farBox (if given) sizes the far plane / control-speed scale separately
+      // from the framing box -- see the computeRobustBox call sites below for
+      // why these can legitimately differ (a tight box frames the dense
+      // "subject" nicely; a wider box still reaches any sparse peripheral
+      // content the user scrolls out toward).
+      const farSize = new THREE.Vector3();
+      (farBox || box).getSize(farSize);
+      const farMaxDim = Math.max(farSize.x, farSize.y, farSize.z, maxDim);
+      const fov = camera.fov * (Math.PI / 180);
+      let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+      cameraZ *= 1.5; // zoom out a bit to fit comfortably
+      camera.position.set(center.x, center.y, center.z + cameraZ);
+      camera.lookAt(center);
+      // The camera's far plane was a fixed placeholder (1000) before any scene
+      // was loaded. A scene that needs cameraZ > 1000 to fit in view -- true for
+      // most large/wide scenes, not just an edge case -- would then sit entirely
+      // beyond the far clipping plane: WebGL discards every fragment past `far`
+      // with no error, so the LOD traversal, upload, and camera math can all
+      // look completely correct in the console while the canvas stays black.
+      // Size near/far around the actual fitted distance with generous margin.
+      camera.near = Math.max(cameraZ / 1000, 1e-4);
+      camera.far = cameraZ + farMaxDim * 2 + 1;
+      camera.updateProjectionMatrix();
+
+      // Remember where the scene is so the render loop can scale control speed
+      // by CURRENT distance every frame (see below) -- a flat multiplier tied
+      // to the whole scene's maxDim was too coarse: far from the geometry it
+      // barely moved the camera, but near the geometry a single wheel notch
+      // (~273 units for a ~1824-unit scene) overshot straight past it, so the
+      // scene was either a distant speck or already behind the camera with no
+      // step size in between.
+      sceneFocus.copy(center);
+      sceneFocusValid = true;
+      sceneMaxDim = Math.max(farMaxDim, 1e-4);
+
+      console.log(
+        `[camera-fit] ${label} -- center:`, center, "size:", size,
+        "maxDim:", maxDim, "farMaxDim:", farMaxDim, "cameraZ:", cameraZ,
+        "near:", camera.near, "far:", camera.far,
+      );
+      return { center, size, maxDim };
+    }
+
+    async function onSplatLoad(mesh) {
+      const splats = mesh.splats; // PagedSplats
+      console.log(
+        "[camera-fit] SplatMesh initial setup resolved (manifest/pager ready). " +
+        "Waiting for chunk geometry to stream in and upload before fitting the camera -- " +
+        "this can take a few seconds for large scenes.",
+      );
+      const pollIntervalMs = 250;
+      const maxAttempts = 80; // ~20s total
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const box = mesh.getBoundingBox();
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const maxDim = Math.max(size.x, size.y, size.z);
+          const numSplats = mesh.numSplats ?? 0;
+          const pagesLoaded = splats?.pager?.pageToSplatsChunk?.filter((v) => v !== undefined)?.length ?? 0;
+          console.log(
+            `[camera-fit] poll ${attempt}/${maxAttempts}: numSplats=${numSplats}, pagesLoaded=${pagesLoaded}, ` +
+            `bbox=[${size.x.toFixed(1)}, ${size.y.toFixed(1)}, ${size.z.toFixed(1)}], maxDim=${maxDim.toFixed(1)}`,
+          );
+          if (maxDim > 1e-6) {
+            // The camera FRAMES on a density-based box (shortest interval
+            // containing 50% of points per axis -- see computeDensityBox),
+            // which locks onto wherever points are actually concentrated
+            // instead of being dragged out by a sparse, widely-spread tail.
+            // A separate WIDE percentile box (p0.5-p99.5) still sizes the far
+            // plane and control speed so sparse peripheral content remains
+            // reachable if the user scrolls/flies out toward it -- nothing is
+            // ever clipped away, just not part of the default framing.
+            const fitBox = computeDensityBox(mesh, 0.5) || box;
+            const wideBox = computeRobustBox(mesh, 0.5, 99.5) || box;
+            const first = fitCameraToBoundingBox(fitBox, `settled after ${attempt} poll(s) (density-based 50% bounds)`, wideBox);
+            console.log(`[camera-fit] scene now visible with ${numSplats} splats across ${pagesLoaded} pages`);
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const laterBox = computeDensityBox(mesh, 0.5) || mesh.getBoundingBox();
+            const laterWideBox = computeRobustBox(mesh, 0.5, 99.5) || mesh.getBoundingBox();
+            const laterSize = new THREE.Vector3();
+            laterBox.getSize(laterSize);
+            if (laterSize.length() > first.size.length() * 1.2) {
+              fitCameraToBoundingBox(laterBox, "refit after further chunk growth (robust bounds)", laterWideBox);
+            } else {
+              console.log("[camera-fit] bounding box stable, keeping initial fit.");
+            }
+            return;
+          }
+        } catch (e) {
+          console.error(`[camera-fit] error reading bounding box on poll ${attempt}:`, e);
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      }
+      const numSplats = mesh.numSplats ?? 0;
+      console.warn(
+        `[camera-fit] gave up after ${maxAttempts} polls (~${(maxAttempts * pollIntervalMs) / 1000}s) -- ` +
+        `bounding box never became non-empty. Current state: numSplats=${numSplats}. ` +
+        "If the border around the viewer is visible but the interior stays black, " +
+        "check the console for [forEachSplat] / [uploadPage] / [decodeSp5Chunk] messages above " +
+        "for Infinity/NaN positions or zero-packed data.",
+      );
     }
 
     async function loadSplatFile(splatFile) {
@@ -303,11 +524,6 @@
         fileBlob: splatFile,
         fileName,
         paged: true,
-        pager: new SplatPager({
-          renderer: renderer,
-          maxCacheSplats,
-          backgroundPrefetch
-        }),
         onLoad: onSplatLoad
       });
     }
