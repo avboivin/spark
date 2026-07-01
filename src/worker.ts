@@ -1242,30 +1242,25 @@ async function decodeSp5Chunk({ chunkBytes }: { chunkBytes: Uint8Array }) {
     getBinaryPart(manifest.mlp_opacity),
   );
 
-  const mlpOffsetW0 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["main.0.weight"]),
-  );
-  const mlpOffsetB0 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["main.0.bias"]),
-  );
-  const mlpOffsetW1 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["main.2.weight"]),
-  );
-  const mlpOffsetB1 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["main.2.bias"]),
-  );
-  const mlpOffsetW2 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["main.4.weight"]),
-  );
-  const mlpOffsetB2 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["main.4.bias"]),
-  );
-  const mlpOffsetW3 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["shs_output.0.weight"]),
-  );
-  const mlpOffsetB3 = float16ArrayToFloat32Array(
-    getBinaryPart(manifest.mlp_offset["shs_output.0.bias"]),
-  );
+  let mlpOffsetW0 = new Float32Array(0);
+  let mlpOffsetB0 = new Float32Array(0);
+  let mlpOffsetW1 = new Float32Array(0);
+  let mlpOffsetB1 = new Float32Array(0);
+  let mlpOffsetW2 = new Float32Array(0);
+  let mlpOffsetB2 = new Float32Array(0);
+  let mlpOffsetW3 = new Float32Array(0);
+  let mlpOffsetB3 = new Float32Array(0);
+
+  if (manifest.mlp_offset && Object.keys(manifest.mlp_offset).length > 0) {
+    mlpOffsetW0 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.0.weight"]));
+    mlpOffsetB0 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.0.bias"]));
+    mlpOffsetW1 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.2.weight"]));
+    mlpOffsetB1 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.2.bias"]));
+    mlpOffsetW2 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.4.weight"]));
+    mlpOffsetB2 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["main.4.bias"]));
+    mlpOffsetW3 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["shs_output.0.weight"]));
+    mlpOffsetB3 = float16ArrayToFloat32Array(getBinaryPart(manifest.mlp_offset["shs_output.0.bias"]));
+  }
 
   const gsplatArray = reconstruct_sp5_chunk(
     xyzRawFloat,
