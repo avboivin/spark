@@ -387,7 +387,7 @@ export class PagedSplats implements SplatSource {
       let lodSplats: PackedResult | ExtResult;
       if (!this.pager.extSplats) {
         const result = (await worker.call("loadPackedSplats", {
-          fileBytes: decodeBytes,
+          fileBytes: decodeBytes!.slice(),
           pathName: this.chunkUrl(chunk),
           sh1Codes: this.sh1Codes?.slice(),
           sh2Codes: this.sh2Codes?.slice(),
@@ -425,7 +425,7 @@ export class PagedSplats implements SplatSource {
         this.sh3Codes = lodSplats.extra.sh3Codes ?? this.sh3Codes;
       } else if (this.fileType === SplatFileType.SP5) {
         const result = (await worker.call("decodeSp5Chunk", {
-          chunkBytes: decodeBytes,
+          chunkBytes: decodeBytes!.slice(),
         })) as ExtResult;
         lodSplats = result;
         if (!this.splatEncoding) {
@@ -445,7 +445,7 @@ export class PagedSplats implements SplatSource {
       } else {
         const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
         const result = (await worker.call("loadExtSplats", {
-          fileBytes: decodeBytes,
+          fileBytes: decodeBytes!.slice(),
           pathName: this.chunkUrl(chunk),
           sh1Codes: this.sh1Codes?.slice(),
           sh2Codes: this.sh2Codes?.slice(),
