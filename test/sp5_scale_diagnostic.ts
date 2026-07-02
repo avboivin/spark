@@ -97,7 +97,9 @@ async function main() {
   const unzipped = fflate.unzipSync(zipBytes);
   const manifest = JSON.parse(new TextDecoder().decode(unzipped['manifest.json']));
 
+  console.log(`\nmanifest: ${manifest.chunks.length} chunks, ${manifest.count} total splats (source was ${numSplats})`);
   const allDecodedScales: number[] = [];
+  let leafCount = 0, nonLeafCount = 0;
   for (const chunkInfo of manifest.chunks) {
     const chunkBytes = unzipped[chunkInfo.file];
     const view = new DataView(chunkBytes.buffer, chunkBytes.byteOffset);
@@ -108,6 +110,33 @@ async function main() {
 
     const count = chunkMeta.count;
     const xyzRawFloat = float16ArrayToFloat32Array(getBin(chunkMeta.xyz_uncompressed));
+    // See converter.ts's chunkXyz comment / worker.ts's decodeSp5Chunk: positions
+    // are chunk-local-normalized now, undo it before use (unused below beyond
+    // feeding reconstruct_sp5_chunk, but keep it correct for consistency).
+    {
+      const chunkCenter: [number, number, number] = chunkMeta.chunk_center ?? [0, 0, 0];
+      const chunkScale: number = chunkMeta.chunk_scale ?? 1;
+      for (let i = 0; i < count; i++) {
+        xyzRawFloat[i * 3 + 0] = xyzRawFloat[i * 3 + 0] * chunkScale + chunkCenter[0];
+        xyzRawFloat[i * 3 + 1] = xyzRawFloat[i * 3 + 1] * chunkScale + chunkCenter[1];
+        xyzRawFloat[i * 3 + 2] = xyzRawFloat[i * 3 + 2] * chunkScale + chunkCenter[2];
+      }
+    }
+
+    // tiny_lod's merged/coarse parent splats are legitimately much larger than
+    // any original leaf splat -- excluding them (child_count === 0 = leaf) keeps
+    // this diagnostic comparing like with like against the source distribution.
+    let lodTreeRaw: Uint32Array | undefined;
+    if (chunkMeta.lod_tree) {
+      let lodTreeBytes = getBin(chunkMeta.lod_tree);
+      if (lodTreeBytes.byteOffset % 4 !== 0) {
+        const aligned = new Uint8Array(lodTreeBytes.length);
+        aligned.set(lodTreeBytes);
+        lodTreeBytes = aligned;
+      }
+      lodTreeRaw = new Uint32Array(lodTreeBytes.buffer, lodTreeBytes.byteOffset, lodTreeBytes.byteLength / 4);
+    }
+    const isLeaf = (i: number) => !lodTreeRaw || lodTreeRaw[i * 4 + 2] === 0;
 
     const scaleIndices: number[] = [];
     for (const hmeta of chunkMeta.scale_index_huffman) {
@@ -146,10 +175,15 @@ async function main() {
 
     const rAttrs = (reconstructed as any).extract_attributes();
     const rScales: Float32Array = new Float32Array(rAttrs.scales); // linear (post-exp), same convention as source
-    for (const v of rScales) allDecodedScales.push(v);
+    for (let i = 0; i < count; i++) {
+      if (!isLeaf(i)) { nonLeafCount++; continue; }
+      leafCount++;
+      allDecodedScales.push(rScales[i * 3 + 0], rScales[i * 3 + 1], rScales[i * 3 + 2]);
+    }
     reconstructed.free();
   }
 
+  console.log(`\nleaf splats: ${leafCount}, non-leaf (merged) splats: ${nonLeafCount}`);
   console.log('\nDecoded (post round-trip) linear scale distribution:');
   const decodedStats = stats('scale (all axes)', allDecodedScales);
 
