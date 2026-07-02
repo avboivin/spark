@@ -132,83 +132,6 @@ function kmeans2d(data: Float32Array, k: number, maxIters: number = 5): Float32A
   return centroids;
 }
 
-// Rearranges idxArr[lo..hi] in place (Hoare-partition quickselect) so that
-// idxArr[n] ends up holding the element that a full sort by xyz[idx*3+axis]
-// would place there, with everything before n <= it and everything after n
-// >= it (a "nth_element", not a full sort -- O(range) average case).
-function nthElementByAxis(idxArr: Int32Array, lo: number, hi: number, n: number, xyz: Float32Array, axis: number) {
-  while (hi > lo) {
-    const pivotIdx = idxArr[(lo + hi) >> 1];
-    const pivotVal = xyz[pivotIdx * 3 + axis];
-    let i = lo;
-    let j = hi;
-    while (i <= j) {
-      while (xyz[idxArr[i] * 3 + axis] < pivotVal) i++;
-      while (xyz[idxArr[j] * 3 + axis] > pivotVal) j--;
-      if (i <= j) {
-        const tmp = idxArr[i];
-        idxArr[i] = idxArr[j];
-        idxArr[j] = tmp;
-        i++;
-        j--;
-      }
-    }
-    if (n <= j) hi = j;
-    else if (n >= i) lo = i;
-    else break;
-  }
-}
-
-// Splits `idxArr` into spatially-coherent groups of at most `chunkSize`
-// indices each, by recursively picking whichever of x/y/z has the LARGEST
-// extent within the current group and splitting at its median (a k-d tree).
-// This is deliberately NOT a single global sort along one fixed axis: a
-// global lexicographic (z,y,x) sort followed by contiguous count-based
-// slicing produces degenerate chunks whenever point density is highly
-// non-uniform, which real-world captures always are -- e.g. a dense building
-// facade plus a sparse, widely-spread field of background/terrain points. A
-// fixed global sort dominated by z packs the dense region into razor-thin,
-// nearly 2D horizontal slabs (measured directly on a real capture: consecutive
-// chunks spanning as little as 0.9 world units in z, i.e. paper-thin slices of
-// a multi-story building) while the sparse tail dominates one or two chunks
-// with an enormous, near-empty bounding box. Re-picking the split axis at
-// every level based on the ACTUAL shape of the current subgroup adapts to
-// this instead of committing to one axis for the whole scene, so each
-// resulting chunk is a roughly cube-shaped, spatially local region regardless
-// of how lopsided the overall point-density distribution is.
-function kdPartitionIndices(idxArr: Int32Array, xyz: Float32Array, chunkSize: number): Int32Array[] {
-  const groups: Int32Array[] = [];
-  const stack: [number, number][] = [[0, idxArr.length - 1]];
-  while (stack.length) {
-    const [lo, hi] = stack.pop()!;
-    const count = hi - lo + 1;
-    if (count <= chunkSize) {
-      groups.push(idxArr.slice(lo, hi + 1));
-      continue;
-    }
-
-    let minV0 = Infinity, minV1 = Infinity, minV2 = Infinity;
-    let maxV0 = -Infinity, maxV1 = -Infinity, maxV2 = -Infinity;
-    for (let p = lo; p <= hi; p++) {
-      const pt = idxArr[p] * 3;
-      const x = xyz[pt], y = xyz[pt + 1], z = xyz[pt + 2];
-      if (x < minV0) minV0 = x; if (x > maxV0) maxV0 = x;
-      if (y < minV1) minV1 = y; if (y > maxV1) maxV1 = y;
-      if (z < minV2) minV2 = z; if (z > maxV2) maxV2 = z;
-    }
-    const extents = [maxV0 - minV0, maxV1 - minV1, maxV2 - minV2];
-    let axis = 0;
-    if (extents[1] > extents[axis]) axis = 1;
-    if (extents[2] > extents[axis]) axis = 2;
-
-    const mid = lo + (count >> 1);
-    nthElementByAxis(idxArr, lo, hi, mid, xyz, axis);
-    stack.push([lo, mid - 1]);
-    stack.push([mid, hi]);
-  }
-  return groups;
-}
-
 // Huffman Code Table Builder
 interface HuffmanNode {
   symbol?: number;
@@ -296,7 +219,6 @@ export async function convertSplatToSp5Client({
   sh1,
   maxSh,
   onProgress,
-  priorityPoint,
   lodBase,
 }: {
   numSplats: number;
@@ -308,17 +230,6 @@ export async function convertSplatToSp5Client({
   sh1?: Float32Array;
   maxSh: number;
   onProgress?: (phase: string, percent: number) => void;
-  // World-space point (in the SOURCE, pre-recenter coordinate space -- same
-  // space as the input `xyz`) to prioritize for fast initial load. Chunk 0 is
-  // fetched unconditionally before any LOD tree exists to discover the rest
-  // of the scene (see worker.ts's synthesizeFlatLodTreeIfMissing), so
-  // whichever spatial region becomes chunk 0 is what appears first,
-  // regardless of where the camera actually starts. If given, the chunk
-  // whose centroid is closest to this point becomes chunk 0 -- e.g. pass
-  // your intended default camera's look-at target/position so the region
-  // visible on load already has its data resident instead of a k-d-tree-order
-  // region unrelated to what the viewer will actually be looking at.
-  priorityPoint?: [number, number, number];
   lodBase?: number;
 }): Promise<Uint8Array> {
   const CHUNK_SIZE = 65536;

@@ -80,11 +80,11 @@ async function main() {
       new Uint32Array([lodId]),
       new Uint32Array([0]),
       camera,
-      new Float32Array([1.0]),
-      new Float32Array([1.0]),
-      new Float32Array([1.0]),
-      new Float32Array([45.0]), // cone_fov0
-      new Float32Array([60.0]), // cone_fov
+      new Float32Array([1.0]), // lodScale
+      new Float32Array([0.2]), // behindFoveate
+      new Float32Array([0.4]), // coneFoveate
+      new Float32Array([90.0]), // cone_fov0
+      new Float32Array([120.0]), // cone_fov
     ) as {
       instanceIndices: { indices: Uint32Array; numSplats: number }[];
     };

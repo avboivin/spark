@@ -163,8 +163,8 @@ struct LodState {
     touched: Vec<(u32, u32)>,
     touched_set: AHashSet<(u32, u32)>,
     buffer: Vec<u32>,
-    last_expanded: AHashSet<(u32, u32)>,
-    current_expanded: AHashSet<(u32, u32)>,
+    last_expanded: AHashSet<(u32, u32, u32)>,
+    current_expanded: AHashSet<(u32, u32, u32)>,
 }
 
 impl LodState {
@@ -286,8 +286,8 @@ pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array) -> Result<Object, J
 pub fn dispose_lod_tree(lod_id: u32) {
     STATE.with_borrow_mut(|state| {
         state.lod_trees.remove(&lod_id);
-        state.last_expanded.retain(|&(id, _)| id != lod_id);
-        state.current_expanded.retain(|&(id, _)| id != lod_id);
+        state.last_expanded.retain(|&(_, id, _)| id != lod_id);
+        state.current_expanded.retain(|&(_, id, _)| id != lod_id);
     })
 }
 
@@ -415,19 +415,20 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
 }
 
 fn should_expand(
+    inst_index: u32,
     lod_id: u32,
     paged_index: u32,
     pixel_scale: f32,
     refine_limit: f32,
     coarsen_limit: f32,
-    last_expanded: &AHashSet<(u32, u32)>,
+    last_expanded: &AHashSet<(u32, u32, u32)>,
 ) -> bool {
     if pixel_scale > coarsen_limit {
         true
     } else if pixel_scale <= refine_limit {
         false
     } else {
-        last_expanded.contains(&(lod_id, paged_index))
+        last_expanded.contains(&(inst_index, lod_id, paged_index))
     }
 }
 
@@ -513,7 +514,7 @@ pub fn traverse_lod_trees(
             let instance = &instances[inst_index as usize];
             let (lod_id, splats, _page_to_chunk, chunk_to_page, ..) = instance;
 
-            let is_expanded = should_expand(*lod_id, paged_index, pixel_scale, refine_limit, coarsen_limit, last_expanded);
+            let is_expanded = should_expand(inst_index, *lod_id, paged_index, pixel_scale, refine_limit, coarsen_limit, last_expanded);
             if !is_expanded {
                 _ = frontier.pop();
                 output.push((inst_index, paged_index));
@@ -558,14 +559,14 @@ pub fn traverse_lod_trees(
                 continue;
             }
 
-            current_expanded.insert((*lod_id, paged_index));
+            current_expanded.insert((inst_index, *lod_id, paged_index));
 
             for child in child_start..child_start + child_count as u32 {
                 let child_chunk = (child >> 16) as usize;
                 let child_page = chunk_to_page[child_chunk];
                 let child_paged_index = (child_page << 16) | (child & 0xffff);
                 let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
-                let child_expand = should_expand(*lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
+                let child_expand = should_expand(inst_index, *lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
                 if !child_expand {
                     output.push((inst_index, child_paged_index));
                 } else {
@@ -750,7 +751,8 @@ pub fn dynamic_traverse_lod_trees(
 
             let mut output_count = 0;
 
-            for (_inst_index, (instance, (mut instance_output, mut stack))) in iterator {
+            for (inst_index, (instance, (mut instance_output, mut stack))) in iterator {
+                let inst_index = inst_index as u32;
                 let (lod_id, splats, _, chunk_to_page, ..) = instance;
                 let chunk_max = lod_chunk_max.entry(*lod_id).or_default();
                 let mut frontier = Vec::with_capacity(stack.len());
@@ -759,7 +761,7 @@ pub fn dynamic_traverse_lod_trees(
                     min_pixel_scale = min_pixel_scale.min(pixel_scale);
                     let refine_limit = current_scale * 0.9;
                     let coarsen_limit = current_scale * 1.15;
-                    let is_expanded = should_expand(*lod_id, paged_index, pixel_scale, refine_limit, coarsen_limit, last_expanded);
+                    let is_expanded = should_expand(inst_index, *lod_id, paged_index, pixel_scale, refine_limit, coarsen_limit, last_expanded);
                     if !is_expanded {
                         frontier.push((paged_index, pixel_scale));
                         continue;
@@ -795,7 +797,7 @@ pub fn dynamic_traverse_lod_trees(
                         continue;
                     }
 
-                    current_expanded.insert((*lod_id, paged_index));
+                    current_expanded.insert((inst_index, *lod_id, paged_index));
         
                     for child in child_start..child_start + child_count as u32 {
                         let child_chunk = (child >> 16) as usize;
@@ -804,7 +806,7 @@ pub fn dynamic_traverse_lod_trees(
                         let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
                         let refine_limit = current_scale * 0.9;
                         let coarsen_limit = current_scale * 1.15;
-                        let child_expand = should_expand(*lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
+                        let child_expand = should_expand(inst_index, *lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
                         if !child_expand {
                             if child_pixel_scale <= pixel_scale_limit {
                                 instance_output.push((child_paged_index, child_pixel_scale));
