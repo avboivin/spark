@@ -439,7 +439,7 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
-    page_bounds: &[f32],  // 5*N: per-page (cx,cy,cz,radius,max_node_size), optional prefilter
+    page_bounds: Option<Box<[f32]>>,  // optional prefilter data, 5*N per page
 ) -> anyhow::Result<Object, JsValue> {
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
@@ -493,6 +493,7 @@ pub fn traverse_lod_trees(
         // The bound is conservative (uses foveate=1.0, i.e. assumes the page
         // is in the central view cone) so the prefilter is provably lossless:
         // it can only skip pages that would contribute zero output anyway.
+        let page_bounds = page_bounds.as_deref().unwrap_or(&[]);
         let page_bounds_len = page_bounds.len();
         let use_prefilter = page_bounds_len >= 5; // at least one page worth of data
         let refine_limit = pixel_scale_limit * 0.9;
@@ -721,7 +722,7 @@ pub fn dynamic_traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
-    page_bounds: &[f32],  // 5*N per-page, same format as traverse_lod_trees
+    page_bounds: Option<Box<[f32]>>,  // optional prefilter data, 5*N per page
     // readback: Uint32Array,
     // flag: bool,
 ) -> anyhow::Result<Object, JsValue> {
@@ -768,6 +769,7 @@ pub fn dynamic_traverse_lod_trees(
         let mut outputs = Vec::with_capacity(num_instances);
 
         // P0b — Same page-level prefilter as standard mode.
+        let page_bounds = page_bounds.as_deref().unwrap_or(&[]);
         let page_bounds_len = page_bounds.len();
         let use_prefilter = page_bounds_len >= 5;
         let refine_limit = pixel_scale_limit * 0.9;

@@ -34,47 +34,63 @@ pub fn simd_enabled() -> bool {
 }
 
 /// Fast Huffman decode using a prefix lookup table (LUT).
-/// Reads bits MSB-first per byte (matching the encoder), accumulates
-/// by shift-left into a u64 buffer, and uses the LUT built on the JS side.
-/// The LUT maps the lut_bits most-significant bits to (code_len, symbol).
+/// Reads whole bytes MSB-first (shift-left accumulation), matching the
+/// encoder's bit order. The LUT maps the lut_bits most-significant bits
+/// to `(code_len << 8) | symbol`. Returns an error if the stream cannot
+/// produce `count` symbols (truncated or corrupt input).
 #[wasm_bindgen]
-pub fn decode_huffman_fast(bytes: &[u8], lut: &[u16], count: u32) -> Vec<u16> {
+pub fn decode_huffman_fast(bytes: &[u8], lut: &[u16], count: u32) -> Result<Vec<u16>, JsValue> {
     let count = count as usize;
     let lut_bits = lut.len().trailing_zeros() as u32;
-    if lut_bits == 0 || lut_bits > 24 { return Vec::new(); }
+    if lut_bits == 0 || lut_bits > 24 {
+        return Err(JsValue::from_str("decode_huffman_fast: invalid LUT size (must be power of 2, <= 2^24)"));
+    }
+    let lut_mask = (lut.len() - 1) as u64;
     let mut out = Vec::with_capacity(count);
-    // Accumulate bits MSB-first (shift-left). We read bytes one at a time,
-    // processing their bits from MSB (bit 7) to LSB (bit 0), shifting each
-    // into bit_buf. After filling to >= lut_bits, we look up the MSBs.
+    // Accumulate bytes MSB-first: each byte is shifted into the high end
+    // of bit_buf. The MSBits of bit_buf encode the prefix for LUT lookup.
     let mut bit_buf: u64 = 0;
     let mut bits_in_buf: u32 = 0;
     let mut byte_idx = 0;
 
-    while out.len() < count && byte_idx < bytes.len() {
-        // Fill buffer to at least lut_bits bits
-        while bits_in_buf < lut_bits && byte_idx < bytes.len() {
-            let b = bytes[byte_idx] as u64;
-            // Process bits 7 down to 0 (MSB-first)
-            for shift in (0..8).rev() {
-                let bit = (b >> shift) & 1;
-                bit_buf = (bit_buf << 1) | bit;
-                bits_in_buf += 1;
-                if bits_in_buf >= lut_bits { break; }
-            }
+    while out.len() < count {
+        // Refill: read whole bytes, never discard partial bytes.
+        // Read until we have at least lut_bits OR run out of input.
+        while bits_in_buf <= 56 && byte_idx < bytes.len() {
+            bit_buf = (bit_buf << 8) | (bytes[byte_idx] as u64);
+            bits_in_buf += 8;
             byte_idx += 1;
         }
-        if bits_in_buf == 0 { break; }
+        if bits_in_buf == 0 {
+            return Err(JsValue::from_str(&format!(
+                "decode_huffman_fast: stream exhausted at {}/{} symbols", out.len(), count
+            )));
+        }
 
-        // Look up MSBs in LUT
-        let shift = bits_in_buf.saturating_sub(lut_bits);
-        let index = if shift < 64 { ((bit_buf >> shift) as usize) & (lut.len() - 1) } else { 0 };
+        // LUT lookup: use the most-significant lut_bits of bit_buf.
+        // If we have fewer than lut_bits, left-align to fill.
+        let index: usize = if bits_in_buf >= lut_bits {
+            ((bit_buf >> (bits_in_buf - lut_bits)) & lut_mask) as usize
+        } else {
+            ((bit_buf << (lut_bits - bits_in_buf)) & lut_mask) as usize
+        };
         let entry = lut[index];
-        if entry == 0xFFFF { break; }
+        if entry == 0xFFFF {
+            return Err(JsValue::from_str(&format!(
+                "decode_huffman_fast: no LUT entry for prefix at {}/{} symbols (bits_in_buf={})",
+                out.len(), count, bits_in_buf
+            )));
+        }
         let code_len = (entry >> 8) as u32;
         let symbol = (entry & 0xFF) as u16;
-        if code_len == 0 || code_len > bits_in_buf { break; }
+        if code_len == 0 || code_len > bits_in_buf {
+            return Err(JsValue::from_str(&format!(
+                "decode_huffman_fast: invalid code_len={} (bits_in_buf={}) at symbol {}/{}",
+                code_len, bits_in_buf, out.len(), count
+            )));
+        }
         out.push(symbol);
-        // Consume code_len bits by masking them out of the buffer
+        // Consume code_len bits by masking out the high end
         bits_in_buf -= code_len;
         if bits_in_buf == 0 {
             bit_buf = 0;
@@ -83,7 +99,7 @@ pub fn decode_huffman_fast(bytes: &[u8], lut: &[u16], count: u32) -> Vec<u16> {
             bit_buf &= mask;
         }
     }
-    out
+    Ok(out)
 }
 
 thread_local! {
