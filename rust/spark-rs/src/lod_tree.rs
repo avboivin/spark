@@ -510,12 +510,16 @@ pub fn traverse_lod_trees(
                     let pcx = page_bounds[b];
                     let pcy = page_bounds[b + 1];
                     let pcz = page_bounds[b + 2];
-                    let _prad = page_bounds[b + 3];
+                    let prad = page_bounds[b + 3];
                     let psiz = page_bounds[b + 4];
                     let pcenter = Vec3A::new(pcx, pcy, pcz);
                     let delta = pcenter - *origin;
-                    let dist = delta.length().max(1.0e-6);
-                    let max_ps = psiz * lod_scale / dist; // conservative: foveate=1.0
+                    let dist = delta.length();
+                    // Closest distance from camera to any point in the page's
+                    // bounding sphere. If the camera is inside the sphere,
+                    // clamp to epsilon to avoid division blow-up.
+                    let closest_dist = (dist - prad).max(1.0e-6);
+                    let max_ps = psiz * lod_scale / closest_dist; // conservative: foveate=1.0
                     if max_ps <= refine_limit {
                         skip[p] = true;
                     }
@@ -609,6 +613,16 @@ pub fn traverse_lod_trees(
             for child in child_start..child_start + child_count as u32 {
                 let child_chunk = (child >> 16) as usize;
                 let child_page = chunk_to_page[child_chunk];
+                // P0b: if the child's page is known to be below refine_limit,
+                // skip expansion — push directly to output. This is the
+                // prefilter's main effect: it prunes the frontier of children
+                // that have no chance of crossing the threshold.
+                let skip_page = (child_page as usize) < skippable_pages[inst_index as usize].len()
+                    && skippable_pages[inst_index as usize][child_page as usize];
+                if skip_page {
+                    output.push((inst_index, (child_page << 16) | (child & 0xffff)));
+                    continue;
+                }
                 let child_paged_index = (child_page << 16) | (child & 0xffff);
                 let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
                 let child_expand = should_expand(inst_index, *lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
@@ -791,11 +805,13 @@ pub fn dynamic_traverse_lod_trees(
                     let pcx = page_bounds[b];
                     let pcy = page_bounds[b + 1];
                     let pcz = page_bounds[b + 2];
+                    let prad = page_bounds[b + 3];
                     let psiz = page_bounds[b + 4];
                     let pcenter = Vec3A::new(pcx, pcy, pcz);
                     let delta = pcenter - instance.4; // origin
-                    let dist = delta.length().max(1.0e-6);
-                    let max_ps = psiz * instance.6 / dist; // lod_scale
+                    let dist = delta.length();
+                    let closest_dist = (dist - prad).max(1.0e-6);
+                    let max_ps = psiz * instance.6 / closest_dist; // lod_scale
                     if max_ps <= refine_limit {
                         skip_root = true;
                     }
