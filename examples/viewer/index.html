@@ -177,6 +177,47 @@
       display: flex;
       align-items: center;
     }
+
+    /* — Manual‑marker buttons (user clicks to log timeline events) — */
+    .perf-markers {
+      position: fixed;
+      bottom: 16px;
+      left: 16px;
+      z-index: 1000;
+      display: flex;
+      gap: 8px;
+      font-family: system-ui, sans-serif;
+    }
+    .perf-markers button {
+      padding: 6px 14px;
+      border: 1px solid #666;
+      border-radius: 4px;
+      background: rgba(30,30,30,0.85);
+      color: #ccc;
+      font-size: 0.8em;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .perf-markers button:hover { background: rgba(60,60,60,0.85); color: #fff; }
+    .perf-markers .btn-good   { border-color: #4a4; color: #8f8; }
+    .perf-markers .btn-bad    { border-color: #a44; color: #f88; }
+
+    /* — FPS counter (top‑right corner, always visible after file load) — */
+    .fps-counter {
+      position: fixed;
+      top: 12px;
+      right: 20px;
+      z-index: 1000;
+      font-family: monospace;
+      font-size: 14px;
+      color: #0f0;
+      background: rgba(0,0,0,0.7);
+      padding: 4px 10px;
+      border-radius: 4px;
+      pointer-events: none;
+    }
+    .fps-counter.low  { color: #f80; }
+    .fps-counter.bad  { color: #f44; }
   </style>
 </head>
 <body>
@@ -193,6 +234,17 @@
     import * as THREE from "three";
     import { SparkRenderer, SplatMesh, SplatPager, transcodeSpz, SparkControls } from "@sparkjsdev/spark";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+    // — UTC timestamp prefix for every console line so log timestamps can be
+    //   correlated with the user's real‑world actions (arrive / wait / done).
+    const _consoleTime = () => {
+      const d = new Date();
+      return d.toISOString().replace('T',' ').replace('Z','') + ' UTC ';
+    };
+    const _origLog = console.log, _origWarn = console.warn, _origError = console.error;
+    console.log   = function(...a) { _origLog.apply(console,   [_consoleTime() + String(a[0] || ''), ...a.slice(1)]); };
+    console.warn  = function(...a) { _origWarn.apply(console,  [_consoleTime() + String(a[0] || ''), ...a.slice(1)]); };
+    console.error = function(...a) { _origError.apply(console, [_consoleTime() + String(a[0] || ''), ...a.slice(1)]); };
 
     const sparkCanvasEl = document.querySelector(".spark-canvas");
     const scene = new THREE.Scene();
@@ -250,7 +302,24 @@
       setTimeout(function () { resize(); }, 100);
     });
 
+    let _lastFrameTime = 0;
+    let _frameLogThrottle = 0;
+
+    // — FPS counter (exponential moving average) —
+    const fpsEl = document.getElementById('fps-counter');
+    let _fpsAvg = 0;
+    const _fpsAlpha = 0.05; // smoothing factor (lower = smoother)
+
     renderer.setAnimationLoop(function animate(time) {
+      // PERF: log frames that exceed 50ms (typically 16.6ms for 60fps)
+      const frameDt = _lastFrameTime ? time - _lastFrameTime : 0;
+      _lastFrameTime = time;
+      if (frameDt > 50) {
+        _frameLogThrottle++;
+        if (_frameLogThrottle % 5 === 1) {
+          console.warn(`[perf-stall] FRAME = ${frameDt.toFixed(1)}ms (target ~16.6ms), time=${(time/1000).toFixed(1)}s`);
+        }
+      }
       resize();
       // orbitControls.update();
       if (sceneFocusValid) {
@@ -278,6 +347,14 @@
         }
       }
       controls.update(camera);
+      // — FPS counter: exponential moving average, updated before render —
+      if (frameDt > 0) {
+        const instantFps = 1000 / frameDt;
+        _fpsAvg = _fpsAvg === 0 ? instantFps : _fpsAvg + _fpsAlpha * (instantFps - _fpsAvg);
+        fpsEl.textContent = _fpsAvg.toFixed(0) + ' FPS';
+        const cls = _fpsAvg < 15 ? 'bad' : _fpsAvg < 30 ? 'low' : '';
+        fpsEl.className = 'fps-counter' + (cls ? ' ' + cls : '');
+      }
       renderer.render(scene, camera);
     });
 
@@ -454,16 +531,79 @@
       return { center, size, maxDim };
     }
 
+    // PERF: instrument startup -- measure time from drop to first non-empty bbox
+    const _startupDropTime = typeof performance !== 'undefined' ? performance.now() : 0;
+
+    // Event-driven camera-fit: resolve when the pager uploads chunk data and
+    // the LOD traversal produces non-zero splats. Falls back to polling if
+    // the event doesn't fire within a timeout.
     async function onSplatLoad(mesh) {
       const splats = mesh.splats; // PagedSplats
-      console.log(
-        "[camera-fit] SplatMesh initial setup resolved (manifest/pager ready). " +
-        "Waiting for chunk geometry to stream in and upload before fitting the camera -- " +
-        "this can take a few seconds for large scenes.",
-      );
       const pollIntervalMs = 250;
       const maxAttempts = 80; // ~20s total
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const startTime = performance.now();
+
+      // Listen for [lod-tree-update] logs: SparkRenderer.ts's updateLodIndices
+      // logs "[lod-tree-update] traverseLodTrees result for mesh UUID: numSplats=N"
+      // the first time N becomes non-zero after a chunk upload. We watch for that.
+      const originalWarn = console.warn;
+      const originalLog = console.log;
+      let _cfitDone = false;
+
+      function checkBbox(mesh) {
+        if (_cfitDone) return true;
+        try {
+          const box = mesh.getBoundingBox();
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const maxDim = Math.max(size.x, size.y, size.z);
+          return maxDim > 1e-6;
+        } catch (_) { return false; }
+      }
+
+      let _cfitResolve = null;
+      const _cfitPromise = new Promise((r) => { _cfitResolve = r; });
+      const _cfitTimeout = 20000; // 20s fallback
+
+      // Override console.log temporarily to detect the first non-zero traverse
+      console.log = function (...args) {
+        originalLog.apply(console, args);
+        const msg = String(args[0] || '');
+        if (msg.includes('[lod-tree-update] traverseLodTrees result') && !_cfitDone) {
+          const numSplatsMatch = msg.match(/numSplats=(\d+)/);
+          if (numSplatsMatch && parseInt(numSplatsMatch[1]) > 0) {
+            if (checkBbox(mesh)) {
+              _cfitDone = true;
+              _cfitResolve?.();
+            }
+          }
+        }
+      };
+      console.warn = function (...args) { originalWarn.apply(console, args); };
+
+      let settled = false;
+      try {
+        await Promise.race([
+          _cfitPromise,
+          new Promise((r) => setTimeout(r, _cfitTimeout)),
+        ]);
+      } catch (_) {}
+
+      // Restore console
+      console.log = originalLog;
+      console.warn = originalWarn;
+
+      if (_cfitDone) {
+        finished(1);
+        return;
+      }
+
+      // Fallback: poll
+      console.log(
+        "[camera-fit] Event-driven fit didn't resolve yet, falling back to polling. " +
+        "Waiting for chunk geometry to stream in...",
+      );
+      for (let attempt = 1; attempt <= maxAttempts && !_cfitDone; attempt++) {
         try {
           const box = mesh.getBoundingBox();
           const size = new THREE.Vector3();
@@ -476,28 +616,8 @@
             `bbox=[${size.x.toFixed(1)}, ${size.y.toFixed(1)}, ${size.z.toFixed(1)}], maxDim=${maxDim.toFixed(1)}`,
           );
           if (maxDim > 1e-6) {
-            // The camera FRAMES on a density-based box (shortest interval
-            // containing 50% of points per axis -- see computeDensityBox),
-            // which locks onto wherever points are actually concentrated
-            // instead of being dragged out by a sparse, widely-spread tail.
-            // A separate WIDE percentile box (p0.5-p99.5) still sizes the far
-            // plane and control speed so sparse peripheral content remains
-            // reachable if the user scrolls/flies out toward it -- nothing is
-            // ever clipped away, just not part of the default framing.
-            const fitBox = computeDensityBox(mesh, 0.5) || box;
-            const wideBox = computeRobustBox(mesh, 0.5, 99.5) || box;
-            const first = fitCameraToBoundingBox(fitBox, `settled after ${attempt} poll(s) (density-based 50% bounds)`, wideBox);
-            console.log(`[camera-fit] scene now visible with ${numSplats} splats across ${pagesLoaded} pages`);
-            await new Promise((resolve) => setTimeout(resolve, 1500));
-            const laterBox = computeDensityBox(mesh, 0.5) || mesh.getBoundingBox();
-            const laterWideBox = computeRobustBox(mesh, 0.5, 99.5) || mesh.getBoundingBox();
-            const laterSize = new THREE.Vector3();
-            laterBox.getSize(laterSize);
-            if (laterSize.length() > first.size.length() * 1.2) {
-              fitCameraToBoundingBox(laterBox, "refit after further chunk growth (robust bounds)", laterWideBox);
-            } else {
-              console.log("[camera-fit] bounding box stable, keeping initial fit.");
-            }
+            _cfitDone = true;
+            finished(attempt);
             return;
           }
         } catch (e) {
@@ -505,14 +625,42 @@
         }
         await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
       }
-      const numSplats = mesh.numSplats ?? 0;
-      console.warn(
-        `[camera-fit] gave up after ${maxAttempts} polls (~${(maxAttempts * pollIntervalMs) / 1000}s) -- ` +
-        `bounding box never became non-empty. Current state: numSplats=${numSplats}. ` +
-        "If the border around the viewer is visible but the interior stays black, " +
-        "check the console for [forEachSplat] / [uploadPage] / [decodeSp5Chunk] messages above " +
-        "for Infinity/NaN positions or zero-packed data.",
-      );
+
+      if (!_cfitDone) {
+        const numSplats = mesh.numSplats ?? 0;
+        console.warn(
+          `[camera-fit] gave up after ${maxAttempts} polls (~${(maxAttempts * pollIntervalMs) / 1000}s) -- ` +
+          `bounding box never became non-empty. Current state: numSplats=${numSplats}. ` +
+          "If the border around the viewer is visible but the interior stays black, " +
+          "check the console for [forEachSplat] / [uploadPage] / [decodeSp5Chunk] messages above " +
+          "for Infinity/NaN positions or zero-packed data.",
+        );
+      }
+
+      async function finished(attempts) {
+        const elapsed = (performance.now() - startTime).toFixed(0);
+        console.log(
+          `[camera-fit] STARTUP METRIC: drop-to-first-bbox = ${elapsed}ms after ${attempts} poll(s), ` +
+          `total pages loaded = ${splats?.pager?.pageToSplatsChunk?.filter((v) => v !== undefined)?.length ?? 0}`,
+        );
+        const box = mesh.getBoundingBox();
+        const fitBox = computeDensityBox(mesh, 0.5) || box;
+        const wideBox = computeRobustBox(mesh, 0.5, 99.5) || box;
+        const first = fitCameraToBoundingBox(fitBox, `settled after ${attempts} poll(s) (density-based 50% bounds)`, wideBox);
+        const numSplats = mesh.numSplats ?? 0;
+        const pagesLoaded = splats?.pager?.pageToSplatsChunk?.filter((v) => v !== undefined)?.length ?? 0;
+        console.log(`[camera-fit] scene now visible with ${numSplats} splats across ${pagesLoaded} pages`);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const laterBox = computeDensityBox(mesh, 0.5) || mesh.getBoundingBox();
+        const laterWideBox = computeRobustBox(mesh, 0.5, 99.5) || mesh.getBoundingBox();
+        const laterSize = new THREE.Vector3();
+        laterBox.getSize(laterSize);
+        if (laterSize.length() > first.size.length() * 1.2) {
+          fitCameraToBoundingBox(laterBox, "refit after further chunk growth (robust bounds)", laterWideBox);
+        } else {
+          console.log("[camera-fit] bounding box stable, keeping initial fit.");
+        }
+      }
     }
 
     async function loadSplatFile(splatFile) {
@@ -564,6 +712,21 @@
       history.pushState(null, '', url);
     });
 
+    // --- manual marker buttons (click handlers write to console) ----------------
+    const _markerCounts = { arrive: 0, good: 0, bad: 0 };
+    document.getElementById('btn-arrive').addEventListener('click', function () {
+      _markerCounts.arrive++;
+      console.log(`[user-marker] ARRIVE #${_markerCounts.arrive} — at viewpoint, waiting for LOD ramp`);
+    });
+    document.getElementById('btn-good').addEventListener('click', function () {
+      _markerCounts.good++;
+      console.log(`[user-marker] DONE-GOOD #${_markerCounts.good} — LOD ramp finished, scene looks correct`);
+    });
+    document.getElementById('btn-bad').addEventListener('click', function () {
+      _markerCounts.bad++;
+      console.log(`[user-marker] DONE-BAD #${_markerCounts.bad} — LOD ramp finished but scene is wrong/clawed-away`);
+    });
+
     document.querySelector('.spz-button').addEventListener('click', async function () {
       const fileInfo =  {
         fileBytes: fileBytes,
@@ -596,7 +759,25 @@
       </span>
       <span class="label">.spz</span>
     </button>
-</button>
+    </button>
+    <!--
+      Manual marker buttons for correlating user-perceived quality against
+      logged timestamps. Click each at the moment described:
+        [Arrive] – you've navigated to a viewpoint and are now waiting for
+                  the LOD to finish loading at this angle.
+        [Good]   – the LOD ramp finished and the scene looks correct/expected.
+        [Bad]    – the LOD ramp finished but the scene is clawed‑away,
+                  blurry, or otherwise wrong at this viewpoint.
+      Each click writes a UTC‑prefixed console.log line so the exact time
+      can be compared with the [perf-stall] / [pager-perf] / [pager-evict]
+      instrumentation.
+    -->
+    <div class="perf-markers">
+      <button id="btn-arrive">[Arrive] waiting for LOD</button>
+      <button class="btn-good" id="btn-good">Done: GOOD</button>
+      <button class="btn-bad"  id="btn-bad">Done: BAD</button>
+    </div>
+    <div class="fps-counter" id="fps-counter">-- FPS</div>
     <canvas class="spark-canvas"></canvas>
   </div>
   <div class="container">

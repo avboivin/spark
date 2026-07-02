@@ -439,6 +439,7 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
+    page_bounds: &[f32],  // 5*N: per-page (cx,cy,cz,radius,max_node_size), optional prefilter
 ) -> anyhow::Result<Object, JsValue> {
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
@@ -485,11 +486,56 @@ pub fn traverse_lod_trees(
         touched.clear();
         touched_set.clear();
 
+        // P0b — Page-level prefilter: compute an upper bound on pixel_scale
+        // for each page using its bounding sphere and max node size. Pages
+        // whose upper bound is below refine_limit can be skipped entirely;
+        // none of their nodes can possibly cross the threshold.
+        // The bound is conservative (uses foveate=1.0, i.e. assumes the page
+        // is in the central view cone) so the prefilter is provably lossless:
+        // it can only skip pages that would contribute zero output anyway.
+        let page_bounds_len = page_bounds.len();
+        let use_prefilter = page_bounds_len >= 5; // at least one page worth of data
+        let refine_limit = pixel_scale_limit * 0.9;
+        // Pre-compute which pages are skippable per instance
+        let mut skippable_pages: Vec<Vec<bool>> = Vec::with_capacity(num_instances);
+        for (inst_index, instance) in instances.iter().enumerate() {
+            let (_, _, _, _, origin, _, lod_scale, _, _, _, _) = instance;
+            let num_pages = instances[inst_index].2.len(); // page_to_chunk length
+            let bounds_start = inst_index * num_pages * 5;
+            let mut skip = vec![false; num_pages];
+            if use_prefilter && bounds_start + num_pages * 5 <= page_bounds_len {
+                for p in 0..num_pages {
+                    let b = bounds_start + p * 5;
+                    let pcx = page_bounds[b];
+                    let pcy = page_bounds[b + 1];
+                    let pcz = page_bounds[b + 2];
+                    let _prad = page_bounds[b + 3];
+                    let psiz = page_bounds[b + 4];
+                    let pcenter = Vec3A::new(pcx, pcy, pcz);
+                    let delta = pcenter - *origin;
+                    let dist = delta.length().max(1.0e-6);
+                    let max_ps = psiz * lod_scale / dist; // conservative: foveate=1.0
+                    if max_ps <= refine_limit {
+                        skip[p] = true;
+                    }
+                }
+            }
+            skippable_pages.push(skip);
+        }
+
         for (inst_index, instance) in instances.iter().enumerate() {
             let (lod_id, splats, ..) = instance;
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
             let root_index = root_page << 16;
+
+            // P0b: skip seeding this instance if its root page's max
+            // pixel_scale bound is below the refine threshold.
+            let rp = root_page as usize;
+            if rp < skippable_pages[inst_index].len() && skippable_pages[inst_index][rp] {
+                continue; // entire instance below threshold, nothing to output
+            }
+
             let pixel_scale = compute_pixel_scale(&splats[root_index as usize], instance);
             frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
             num_splats += 1;
@@ -498,11 +544,9 @@ pub fn traverse_lod_trees(
                 touched.push((*lod_id, 0));
             }
         }
-        
         let mut min_pixel_scale = f32::INFINITY;
         let mut leaf_count = 0;
 
-        let refine_limit = pixel_scale_limit * 0.9;
         let coarsen_limit = pixel_scale_limit * 1.15;
 
         while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index)) = frontier.peek() {
@@ -677,6 +721,7 @@ pub fn dynamic_traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
+    page_bounds: &[f32],  // 5*N per-page, same format as traverse_lod_trees
     // readback: Uint32Array,
     // flag: bool,
 ) -> anyhow::Result<Object, JsValue> {
@@ -721,13 +766,42 @@ pub fn dynamic_traverse_lod_trees(
         let mut lod_chunk_max: AHashMap<u32, Vec<f32>> = AHashMap::new();
 
         let mut outputs = Vec::with_capacity(num_instances);
+
+        // P0b — Same page-level prefilter as standard mode.
+        let page_bounds_len = page_bounds.len();
+        let use_prefilter = page_bounds_len >= 5;
+        let refine_limit = pixel_scale_limit * 0.9;
+
         for (inst_index, instance) in instances.iter().enumerate() {
             let (lod_id, splats, ..) = instance;
             let root_page = root_pages[inst_index];
             let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
             let root_index = root_page << 16;
-            let root_scale = compute_pixel_scale(&splats[root_index as usize], instance);
-            let frontier = vec![(root_index, root_scale)];
+
+            // Check if root page is skippable
+            let rp = root_page as usize;
+            let num_pages = instance.2.len(); // page_to_chunk length
+            let mut skip_root = false;
+            if use_prefilter {
+                let bounds_start = inst_index * num_pages * 5;
+                if bounds_start + rp * 5 + 5 <= page_bounds_len {
+                    let b = bounds_start + rp * 5;
+                    let pcx = page_bounds[b];
+                    let pcy = page_bounds[b + 1];
+                    let pcz = page_bounds[b + 2];
+                    let psiz = page_bounds[b + 4];
+                    let pcenter = Vec3A::new(pcx, pcy, pcz);
+                    let delta = pcenter - instance.4; // origin
+                    let dist = delta.length().max(1.0e-6);
+                    let max_ps = psiz * instance.6 / dist; // lod_scale
+                    if max_ps <= refine_limit {
+                        skip_root = true;
+                    }
+                }
+            }
+
+            let root_scale = if skip_root { 0.0 } else { compute_pixel_scale(&splats[root_index as usize], instance) };
+            let frontier = if skip_root { Vec::new() } else { vec![(root_index, root_scale)] };
             let instance_output = Vec::with_capacity(1000);
             outputs.push((instance_output, frontier));
 

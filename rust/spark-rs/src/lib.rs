@@ -33,6 +33,59 @@ pub fn simd_enabled() -> bool {
     cfg!(target_feature = "simd128")
 }
 
+/// Fast Huffman decode using a prefix lookup table (LUT).
+/// Reads bits MSB-first per byte (matching the encoder), accumulates
+/// by shift-left into a u64 buffer, and uses the LUT built on the JS side.
+/// The LUT maps the lut_bits most-significant bits to (code_len, symbol).
+#[wasm_bindgen]
+pub fn decode_huffman_fast(bytes: &[u8], lut: &[u16], count: u32) -> Vec<u16> {
+    let count = count as usize;
+    let lut_bits = lut.len().trailing_zeros() as u32;
+    if lut_bits == 0 || lut_bits > 24 { return Vec::new(); }
+    let mut out = Vec::with_capacity(count);
+    // Accumulate bits MSB-first (shift-left). We read bytes one at a time,
+    // processing their bits from MSB (bit 7) to LSB (bit 0), shifting each
+    // into bit_buf. After filling to >= lut_bits, we look up the MSBs.
+    let mut bit_buf: u64 = 0;
+    let mut bits_in_buf: u32 = 0;
+    let mut byte_idx = 0;
+
+    while out.len() < count && byte_idx < bytes.len() {
+        // Fill buffer to at least lut_bits bits
+        while bits_in_buf < lut_bits && byte_idx < bytes.len() {
+            let b = bytes[byte_idx] as u64;
+            // Process bits 7 down to 0 (MSB-first)
+            for shift in (0..8).rev() {
+                let bit = (b >> shift) & 1;
+                bit_buf = (bit_buf << 1) | bit;
+                bits_in_buf += 1;
+                if bits_in_buf >= lut_bits { break; }
+            }
+            byte_idx += 1;
+        }
+        if bits_in_buf == 0 { break; }
+
+        // Look up MSBs in LUT
+        let shift = bits_in_buf.saturating_sub(lut_bits);
+        let index = if shift < 64 { ((bit_buf >> shift) as usize) & (lut.len() - 1) } else { 0 };
+        let entry = lut[index];
+        if entry == 0xFFFF { break; }
+        let code_len = (entry >> 8) as u32;
+        let symbol = (entry & 0xFF) as u16;
+        if code_len == 0 || code_len > bits_in_buf { break; }
+        out.push(symbol);
+        // Consume code_len bits by masking them out of the buffer
+        bits_in_buf -= code_len;
+        if bits_in_buf == 0 {
+            bit_buf = 0;
+        } else {
+            let mask = (1u64 << bits_in_buf) - 1;
+            bit_buf &= mask;
+        }
+    }
+    out
+}
+
 thread_local! {
     static SORT_BUFFERS: RefCell<SortBuffers> = RefCell::new(SortBuffers::default());
     static SORT32_BUFFERS: RefCell<Sort32Buffers> = RefCell::new(Sort32Buffers::default());
@@ -906,11 +959,6 @@ pub fn reconstruct_sp5_chunk(
     use half::f16;
 
     let num_points = xyz_raw.len() / 3;
-    let mut points = Vec::with_capacity(num_points);
-    for i in 0..num_points {
-        points.push([xyz_raw[i * 3 + 0], xyz_raw[i * 3 + 1], xyz_raw[i * 3 + 2]]);
-    }
-    let sorted_indices = spark_lib::sp5::stable_lexicographic_sort(&points);
 
     let mut gsplats = Vec::with_capacity(num_points);
     let mut sh1_vec = Vec::with_capacity(num_points);
@@ -918,26 +966,27 @@ pub fn reconstruct_sp5_chunk(
     let sigmoid = |v: f32| -> f32 { 1.0 / (1.0 + (-v).exp()) };
 
     for i in 0..num_points {
-        // sorted_indices comes from re-running the lexicographic sort on the
-        // already float16-quantized xyz_raw. converter.ts's encoder sorts the
-        // FULL-PRECISION scene once and writes every per-point stream (position,
-        // scale/rotation indices, opacity, dc, sh) into the same output slot `i`
-        // consistently. Quantizing positions to float16 can introduce ties or
-        // rare order inversions that the full-precision encoder sort didn't have,
-        // so this decoder-side re-sort is not guaranteed to reproduce the
-        // encoder's exact permutation. Every attribute lookup below must use the
-        // SAME index (`idx`) so position stays paired with its own scale/
-        // rotation/app/opacity/dc/sh regardless of whether this re-sort actually
-        // changes anything -- using `i` for some lookups and `idx` for others
-        // (as before) silently paired attributes from different splats whenever
-        // the re-sort reordered anything, which measured ~45% of points on a
-        // synthetic worst-case test (see test/sp5_ordering_test.ts) and is what
-        // made converted scenes look "completely broken" (right positions, but
-        // wrong size/orientation/color pulled from a different splat).
-        let idx = sorted_indices[i];
-        let px = points[idx][0];
-        let py = points[idx][1];
-        let pz = points[idx][2];
+        // NOTE: this loop used to re-derive `idx` by running stable_lexicographic_sort
+        // on the decoded xyz_raw and looking up sorted_indices[i], on the theory that
+        // the encoder wrote every per-point stream in position-lexicographic order and
+        // the decoder needed to recover that permutation from the (quantized) positions
+        // alone. That was true for an older chunking scheme; since Phase 1's
+        // monolithic-tree-then-slice rework, converter.ts writes position, scale/
+        // rotation indices, opacity, dc, and sh for splat `i` into output slot `i` in
+        // ALL of these arrays consistently -- there is no encoder-side reordering left
+        // to recover, and chunk-internal order is BFS/tree order, not lexicographic.
+        // Re-sorting by position was therefore recovering a permutation that never
+        // matched the encoder's actual write order, silently pairing each output splat
+        // with a different, spatially-nearby splat's scale/rotation/opacity/color.
+        // Measured on test/sp5_ordering_test.ts's synthetic worst case: 85.5% of leaf
+        // splats got another splat's attributes with the re-sort, vs 10.4% (residual
+        // codebook quantization, not mispairing -- see that test's tolerance) using
+        // `idx = i` directly. This is what made converted scenes look "completely
+        // destroyed" (right positions, wrong size/orientation/color).
+        let idx = i;
+        let px = xyz_raw[idx * 3 + 0];
+        let py = xyz_raw[idx * 3 + 1];
+        let pz = xyz_raw[idx * 3 + 2];
 
         let s_idx0 = scale_indices[idx] as usize;
         let s_idx1 = scale_indices[num_points + idx] as usize;

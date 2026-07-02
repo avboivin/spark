@@ -349,6 +349,8 @@ export class PagedSplats implements SplatSource {
         (cacheHit ? `, cachedBytes=${decodeBytes!.length}` : ""),
     );
 
+    const fetchStart = performance.now();
+
     if (!cacheHit) {
       if (this.fileType === SplatFileType.RAD) {
         const { meta, chunksStart } = await this.getRadMeta();
@@ -425,20 +427,23 @@ export class PagedSplats implements SplatSource {
       }
     }
 
-    return await workerPool.withWorker(async (worker) => {
+    const workerStart = performance.now();
+    const result = await workerPool.withWorker(async (worker) => {
       if (!this.pager) {
         throw new Error("PagedSplats.pager not set");
       }
       let lodSplats: PackedResult | ExtResult = null as any;
       if (this.fileType === SplatFileType.SP5) {
-        // Chunk 0 is the only chunk guaranteed to become the traversal root
-        // (SparkRenderer.ts sets record.rootPage from whichever upload has
-        // chunk === 0), so it's the only one that needs sibling-chunk
-        // pointers stitched into its synthesized tree -- see
-        // synthesizeFlatLodTreeIfMissing's doc comment in worker.ts for why
-        // every other chunk is otherwise completely unreachable by
-        // traversal. The manifest already has every chunk's aabb/count from
-        // conversion time, so this needs no extra fetch.
+        // LEGACY-FALLBACK-ONLY: siblingChunks is only consumed by
+        // synthesizeFlatLodTreeIfMissing (worker.ts) for flat/synthetic LOD
+        // trees where chunk 0's one-level tree needs explicit pointers to
+        // every other chunk (no real hierarchy to discover them organically).
+        // Real hierarchical trees (manifest.lodTree === true) bypass this
+        // entirely -- cross-chunk connections come from genuine parent-child
+        // edges written during conversion (converter.ts's lodTreeSlice).
+        // Do NOT re-purpose siblingChunks for real-tree stitching; the former
+        // stitchRealLodTreeWithSiblings function has been removed as it
+        // silently orphaned ~99% of content (see plan3.md §2 FIXED).
         let siblingChunks:
           | { chunkIndex: number; center: [number, number, number]; size: number }[]
           | undefined;
@@ -556,8 +561,15 @@ export class PagedSplats implements SplatSource {
         );
       }
 
+      const workerElapsed = (performance.now() - workerStart).toFixed(1);
+      console.log(
+        `[pager-perf] fetchDecodeChunk chunk=${chunk}: workerRPC+decode = ${workerElapsed}ms, ` +
+        `numSplats=${lodSplats.numSplats}, cacheHit=${cacheHit}`,
+      );
+
       return lodSplats;
     });
+    return result;
   }
 
   update(numSplats: number, indices: Uint32Array) {
@@ -1316,6 +1328,14 @@ export class SplatPager {
     const needed = [];
     const overflow = [];
     let numPages = 0;
+    let enqueued = 0;
+
+    if (this.fetchPriority.length > 0) {
+      console.log(
+        `[pager-perf] driveFetchers: fetchPriority.length=${this.fetchPriority.length}, ` +
+        `fetchers=${this.fetchers.length}/${this.numFetchers}, fetched=${this.fetched.length}`,
+      );
+    }
 
     for (const { splats, chunk } of this.fetchPriority) {
       const pageLru = this.getSplatsChunk(splats, chunk);
@@ -1369,6 +1389,7 @@ export class SplatPager {
           });
         // Add self to active fetchers list
         this.fetchers.push({ splats, chunk, promise });
+        enqueued++;
 
         promise.then((data) => {
           if (this.autoDrive) {
@@ -1391,7 +1412,13 @@ export class SplatPager {
       this.pageLru.add(pageLru);
     }
 
-    // Create set of pages not needed
+    // Create set of pages not needed — but exclude recently-uploaded pages
+    // to prevent evict-then-refetch thrashing during rotation: when the camera
+    // sweeps across chunks quickly, a page that was just loaded may briefly
+    // fall out of the foveation cone and get marked freeable, only to be
+    // re-requested moments later when the camera finishes its sweep. A 10s
+    // keep-warm window lets pages ride out short-term viewpoint changes.
+    const PAGE_KEEP_WARM_MS = 10000;
     const extraPages = new Set(this.pageLru);
     for (const pageLru of needed.reverse()) {
       extraPages.delete(pageLru);
@@ -1400,7 +1427,20 @@ export class SplatPager {
       this.pageLru.delete(pageLru);
       this.pageLru.add(pageLru);
     }
-    this.freeablePages = Array.from(extraPages).map(({ page }) => page);
+    // Exclude recently-uploaded pages from freeable
+    const freeablePages: number[] = [];
+    for (const pageLru of extraPages) {
+      const { page } = pageLru;
+      const info = this.pageToSplatsChunk[page];
+      const age = info ? now - info.time : PAGE_KEEP_WARM_MS + 1;
+      if (age > PAGE_KEEP_WARM_MS) {
+        freeablePages.push(page);
+      }
+    }
+    this.freeablePages = freeablePages;
+    if (enqueued > 0) {
+      console.log(`[pager-perf] driveFetchers: enqueued ${enqueued} new fetch(es), freeable=${this.freeablePages.length} pages`);
+    }
   }
 
   private async runBackgroundPrefetch() {
@@ -1537,6 +1577,11 @@ export class SplatPager {
     }
 
     const { splats, chunk } = splatsChunk;
+    const pageAge = (performance.now() - splatsChunk.time).toFixed(0);
+    console.log(
+      `[pager-evict] evicting page=${page} chunk=${chunk} age=${pageAge}ms ` +
+      `(freeable=${this.freeablePages.length + 1}, totalLRU=${this.pageLru.size})`,
+    );
     this.removeSplatsChunkPage(splats, chunk, page);
     this.lodTreeUpdates.push({
       splats,
@@ -1641,6 +1686,9 @@ export class SplatPager {
   }
 
   processUploads() {
+    let uploadCount = 0;
+    let uploadSplats = 0;
+    const uploadStart = performance.now();
     while (true) {
       const upload = this.readyUploads.shift();
       if (!upload) {
@@ -1648,6 +1696,14 @@ export class SplatPager {
       }
       const { page, numSplats, packedArray, extArray, shArrays } = upload;
       this.uploadPage(page, packedArray, shArrays, extArray);
+      uploadCount++;
+      uploadSplats += numSplats;
+    }
+    if (uploadCount > 0) {
+      const elapsed = (performance.now() - uploadStart).toFixed(1);
+      console.log(
+        `[pager-perf] GPU upload: ${uploadCount} page(s), ${uploadSplats} splats, ${elapsed}ms`,
+      );
     }
   }
 

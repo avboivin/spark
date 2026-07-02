@@ -385,6 +385,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodRenderScale: number;
   lodInflate: boolean;
   lodTraverseMode: "dynamic" | "standard";
+  _lodTraverseModeExplicit = false;
   pagedExtSplats: boolean;
   maxPagedSplats: number;
   numLodFetchers: number;
@@ -442,8 +443,18 @@ export class SparkRenderer extends THREE.Mesh {
   lastTraverseTime = 0;
   lastPixelLimit?: number;
 
+  // Predictive prefetch: track recent camera orientations to estimate
+  // angular velocity for boosting fetch priority of chunks the camera is
+  // rotating toward (cache warm-up only, not fed into LOD traversal).
+  private _angVelQuats: { quat: THREE.Quaternion; time: number }[] = [];
+  private _angVelMaxHistory = 5;
+
   pager?: SplatPager;
   pagerId = 0;
+  // Persistent queue of traversal-discovered chunks that exceeded the
+  // per-frame enqueue cap; drained on subsequent frames so no chunk is
+  // permanently lost while the camera is stationary.
+  _pendingFetchChunks: { splats: PagedSplats; chunk: number }[] = [];
   // prefetchCameras: THREE.Camera[] = [];
   // prefetchLodScale = 1.0;
   // prefetchMeshesCache: SplatMesh[] = [];
@@ -533,6 +544,9 @@ export class SparkRenderer extends THREE.Mesh {
     this.lodRenderScale = options.lodRenderScale ?? 1.0;
     this.lodInflate = options.lodInflate ?? false;
     this.lodTraverseMode = options.lodTraverseMode ?? "standard";
+    // Track whether the user explicitly set a mode (vs default) so we can
+    // auto-switch to dynamic for large trees without overriding explicit choice.
+    this._lodTraverseModeExplicit = options.lodTraverseMode !== undefined;
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? (isIos() ? 96 : 128) : 256;
     this.maxPagedSplats = options.maxPagedSplats ?? defaultPages * 65536;
@@ -1456,6 +1470,54 @@ export class SparkRenderer extends THREE.Mesh {
       >,
     );
 
+    // P0a: Auto-select "dynamic" traversal when the tree exceeds ~10 resident
+    // pages. Standard mode's BinaryHeap frontier cost grows superlinearly
+    // (measured: 52ms at 4 pages → 749ms at 40 pages on splat_v2), while
+    // dynamic's threshold-sweeping is O(passes × N) and independent of heap
+    // size. Only applies when the user didn't explicitly set a mode — an
+    // explicit `lodTraverseMode: "standard"` is always honored.
+    // The 10-page threshold corresponds to ~655K resident tree nodes; below
+    // that, standard mode's determinism (no threshold-sweep convergence
+    // noise) is preferred.
+    const DYNAMIC_PAGE_THRESHOLD = 10;
+    if (!this._lodTraverseModeExplicit && this.pager) {
+      const pageCount = this.pager.pageToSplatsChunk.filter(v => v !== undefined).length;
+      const desiredMode = pageCount > DYNAMIC_PAGE_THRESHOLD ? "dynamic" : "standard";
+      if (desiredMode !== this.lodTraverseMode) {
+        console.log(
+          `[traverse-mode] auto-switch: ${this.lodTraverseMode} → ${desiredMode} ` +
+          `(pages=${pageCount}, threshold=${DYNAMIC_PAGE_THRESHOLD})`,
+        );
+        this.lodTraverseMode = desiredMode;
+      }
+    }
+
+    // P0b: build per-page bounds for the traversal prefilter.
+    let pageBounds: Float32Array | undefined;
+    for (const mesh of lodMeshes) {
+      const splats = mesh.paged;
+      if (splats instanceof PagedSplats && splats.cachedMeta) {
+        const chunks = splats.cachedMeta.chunks as any[];
+        const bounds = new Float32Array(chunks.length * 5);
+        for (let i = 0; i < chunks.length; i++) {
+          const aabb = chunks[i]?.aabb;
+          if (aabb && aabb.length >= 6) {
+            const b = i * 5;
+            bounds[b] = (aabb[0] + aabb[3]) / 2;
+            bounds[b + 1] = (aabb[1] + aabb[4]) / 2;
+            bounds[b + 2] = (aabb[2] + aabb[5]) / 2;
+            const dx = aabb[3] - aabb[0];
+            const dy = aabb[4] - aabb[1];
+            const dz = aabb[5] - aabb[2];
+            bounds[b + 3] = Math.hypot(dx, dy, dz) / 2;
+            bounds[b + 4] = Math.max(dx, dy, dz) / 2;
+          }
+        }
+        pageBounds = bounds;
+        break;
+      }
+    }
+
     const traverseStart = performance.now();
     const result = (await worker.call("traverseLodTrees", {
       maxSplats,
@@ -1463,6 +1525,9 @@ export class SparkRenderer extends THREE.Mesh {
       lastPixelLimit: this.lastPixelLimit,
       instances,
       traverseMode: this.lodTraverseMode,
+      // Slice to prevent getTransferable from detaching the shared buffer;
+      // the raycast traverse below also needs it live.
+      pageBounds: pageBounds?.slice(),
     })) as {
       keyIndices: Record<
         string,
@@ -1471,7 +1536,14 @@ export class SparkRenderer extends THREE.Mesh {
       chunks: [number, number][];
       pixelLimit?: number;
     };
-    this.lastTraverseTime = performance.now() - traverseStart;
+    const traverseElapsed = performance.now() - traverseStart;
+    this.lastTraverseTime = traverseElapsed;
+    if (traverseElapsed > 50) {
+      console.warn(
+        `[perf-stall] traverseLodTrees RPC = ${traverseElapsed.toFixed(1)}ms ` +
+        `(maxSplats=${maxSplats}, pixelScaleLimit=${pixelScaleLimit.toExponential(2)})`,
+      );
+    }
 
     const { keyIndices, chunks, pixelLimit } = result;
     this.lastPixelLimit = pixelLimit;
@@ -1509,19 +1581,62 @@ export class SparkRenderer extends THREE.Mesh {
         );
       }
 
-      // Fetch root chunk of each paged splats in priority of distance to camera
+      // Ensure chunk 0 is always at highest priority.
+      // DriveFetchers naturally skips already-loaded / already-fetching
+      // entries, so including all previously-discovered chunks in the
+      // priority list across frames is safe — they simply drain at the
+      // rate determined by numFetchers and per-frame caps.
       pagedMeshes.sort((a, b) => a.distance - b.distance);
-      this.pager.fetchPriority = pagedMeshes.map(({ splats }) => ({
+      const basePriority = pagedMeshes.map(({ splats }) => ({
         splats,
         chunk: 0,
       }));
 
+      // Per-frame cap on new chunk fetches enqueued from traversal results.
+      // During rotation the foveation cone can sweep across many sibling
+      // chunks in a single frame; pushing all of them at once floods the
+      // decode queue. Capping new enqueues lets the pipeline drain at its
+      // natural rate while the persisted queue ensures no chunk is lost.
+      const MAX_NEW_FETCHES_PER_TRAVERSAL = 3;
+      let newFetchesEnqueued = 0;
+      const newDiscovered: { splats: PagedSplats; chunk: number }[] = [];
       for (const [lodId, chunk] of chunks) {
+        if (newFetchesEnqueued >= MAX_NEW_FETCHES_PER_TRAVERSAL) break;
         const splats = this.lodIdToSplats.get(lodId);
         if (splats instanceof PagedSplats) {
           if (chunk !== 0) {
-            this.pager.fetchPriority.push({ splats, chunk });
+            newDiscovered.push({ splats, chunk });
+            newFetchesEnqueued++;
           }
+        }
+      }
+
+      // Build fetchPriority: chunk-0 always first, then persisted pending
+      // entries from previous frames, then newly-discovered this frame.
+      // Deduplication: driveFetchers skips entries already loaded/fetching,
+      // so duplicates across frames are harmless — they just mean a second
+      // lookup is a no-op.
+      this._pendingFetchChunks = this._pendingFetchChunks || [];
+      const seen = new Set<string>();
+      const combined: { splats: PagedSplats; chunk: number }[] = [];
+      for (const e of [...basePriority, ...this._pendingFetchChunks, ...newDiscovered]) {
+        const key = `${(e.splats as any)._id ?? 's'}_${e.chunk}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          combined.push(e);
+        }
+      }
+      this.pager.fetchPriority = combined;
+
+      // Persist entries that didn't fit in this frame's cap for next frame.
+      // These are the traversal-discovered chunks beyond MAX_NEW_FETCHES_PER_TRAVERSAL.
+      this._pendingFetchChunks = [];
+      let capped = 0;
+      for (const [lodId, chunk] of chunks) {
+        if (capped < MAX_NEW_FETCHES_PER_TRAVERSAL) { capped++; continue; }
+        const splats = this.lodIdToSplats.get(lodId);
+        if (splats instanceof PagedSplats && chunk !== 0) {
+          this._pendingFetchChunks.push({ splats, chunk });
         }
       }
 
@@ -1542,7 +1657,8 @@ export class SparkRenderer extends THREE.Mesh {
         if (
           splats instanceof PagedSplats &&
           splats.fileType === SplatFileType.SP5 &&
-          splats.cachedMeta
+          splats.cachedMeta &&
+          !splats.cachedMeta.lodTree // Only prefetch all chunks up front if there's no real hierarchical LOD tree
         ) {
           const numChunks = splats.cachedMeta.chunks?.length ?? 0;
           for (let chunk = 1; chunk < numChunks; chunk++) {
@@ -1553,6 +1669,89 @@ export class SparkRenderer extends THREE.Mesh {
 
       this.pager.autoDrive = this.enableLodFetching;
       if (this.enableLodFetching) {
+        // Predictive prefetch: if the user is actively rotating the camera,
+        // estimate where they'll be looking ~0.4s ahead and warm the cache
+        // by boosting fetch priority for chunks whose AABB centers lie in
+        // that direction. This is a CACHE-WARM hint only — the extrapolated
+        // camera is NOT fed into the LOD traversal (which would cause visual
+        // instability; see plan2 §6.3). It only influences which chunks get
+        // fetched earlier in the background, so when the camera actually
+        // arrives at that orientation the data is already decoded.
+        const now = performance.now();
+        const currentQuat = viewQuat.clone();
+        this._angVelQuats.push({ quat: currentQuat, time: now });
+        if (this._angVelQuats.length > this._angVelMaxHistory) {
+          this._angVelQuats.shift();
+        }
+        // Remove samples older than 500ms
+        while (this._angVelQuats.length > 1 && now - this._angVelQuats[0].time > 500) {
+          this._angVelQuats.shift();
+        }
+
+        const ANG_VEL_THRESHOLD = 0.05; // radians per frame at 60fps ≈ ~3°/frame
+        const q0 = this._angVelQuats.length >= 2 ? this._angVelQuats[0].quat : currentQuat;
+        const q1 = this._angVelQuats.length >= 2 ? this._angVelQuats[this._angVelQuats.length - 1].quat : currentQuat;
+        const dt = this._angVelQuats.length >= 2 ? (now - this._angVelQuats[0].time) / 1000 : 0;
+        // Quaternion difference: angular change ≈ 2 * acos(|dot(q0,q1)|)
+        const qDot = Math.min(1, Math.abs(q0.dot(q1)));
+        const angVel = dt > 0.001 ? (2 * Math.acos(qDot)) / dt : 0;
+
+        if (angVel > ANG_VEL_THRESHOLD) {
+          // Determine rotation direction: cross product of forward vectors
+          const fwd0 = new THREE.Vector3(0, 0, -1).applyQuaternion(q0);
+          const fwd1 = new THREE.Vector3(0, 0, -1).applyQuaternion(q1);
+          const rotAxis = new THREE.Vector3().crossVectors(fwd0, fwd1).normalize();
+          const rotDir = rotAxis.y > 0 ? 1 : -1; // yaw sign (simplistic, works for horizontal rotation)
+
+          // Extrapolate ~0.4s ahead
+          const extrapAngle = angVel * 0.4 * rotDir;
+          const extrapQuat = new THREE.Quaternion().setFromAxisAngle(
+            new THREE.Vector3(0, 1, 0), extrapAngle,
+          ).multiply(q1);
+          const extrapFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(extrapQuat).normalize();
+
+          // Find chunks whose AABB center lies roughly in the extrapolated direction
+          for (const { splats } of pagedMeshes) {
+            if (
+              splats instanceof PagedSplats &&
+              splats.cachedMeta &&
+              splats.cachedMeta.lodTree // only for real hierarchical trees; flat trees prefetch all already
+            ) {
+              const chunks = splats.cachedMeta.chunks as any[];
+              let prefetchCount = 0;
+              const MAX_PREFETCH_HINTS = 2; // at most 2 extra hints per frame
+              for (let c = 1; c < chunks.length && prefetchCount < MAX_PREFETCH_HINTS; c++) {
+                const aabb = chunks[c]?.aabb;
+                if (!aabb || aabb.length < 6) continue;
+                const aabbCx = (aabb[0] + aabb[3]) / 2;
+                const aabbCy = (aabb[1] + aabb[4]) / 2;
+                const aabbCz = (aabb[2] + aabb[5]) / 2;
+                const toChunk = new THREE.Vector3(
+                  aabbCx - viewPos.x,
+                  aabbCy - viewPos.y,
+                  aabbCz - viewPos.z,
+                ).normalize();
+                const dotProduct = extrapFwd.dot(toChunk);
+                // Chunk is within ~45° cone of extrapolated forward
+                if (dotProduct > 0.7) {
+                  // Only hint if not already in priority/fetching/loaded
+                  if (!this.pager.fetchPriority.some(p => p.splats === splats && p.chunk === c) &&
+                      !this.pager.fetchers.some(p => p.splats === splats && p.chunk === c) &&
+                      !this.pager.fetched.some(p => p.splats === splats && p.chunk === c) &&
+                      !this.pager.getSplatsChunk(splats, c)) {
+                    this.pager.fetchPriority.push({ splats, chunk: c });
+                    prefetchCount++;
+                    console.log(
+                      `[prefetch-predict] boosted fetch priority for chunk ${c} ` +
+                      `(dot=${dotProduct.toFixed(3)}, angVel=${(angVel * 180 / Math.PI).toFixed(1)}°/s)`,
+                    );
+                  }
+                }
+              }
+            }
+          }
+        }
+
         this.pager.driveFetchers();
       }
     }
@@ -1567,6 +1766,8 @@ export class SparkRenderer extends THREE.Mesh {
         maxSplats: Math.min(this.lodRaycast, Math.round(totalLodSplats * 0.1)),
         pixelScaleLimit,
         instances,
+        traverseMode: this.lodTraverseMode,
+        pageBounds: pageBounds?.slice(),
       })) as {
         keyIndices: Record<
           string,
