@@ -401,6 +401,12 @@ export class SparkRenderer extends THREE.Mesh {
   lodWorker: SplatWorker | null = null;
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
+  // Tracks whether the camera moved since the last traversal — used to
+  // throttle re-traversals triggered by background chunk uploads. When
+  // false, new pages are added to the WASM tree silently and discovered
+  // on the next camera-driven traversal instead of forcing a full
+  // re-traversal (~300ms) for every upload.
+  _cameraMovedSinceLastTraversal = true;
   lodIds: Map<
     PackedSplats | ExtSplats | PagedSplats,
     { lodId: number; lastTouched: number; rootPage?: number }
@@ -1200,6 +1206,7 @@ export class SparkRenderer extends THREE.Mesh {
       const similarity = distanceRamp * quatRamp;
       if (similarity < 0.999) {
         this.lodDirty = true;
+        this._cameraMovedSinceLastTraversal = true;
       }
     }
 
@@ -1335,7 +1342,12 @@ export class SparkRenderer extends THREE.Mesh {
         const lodUpdates = this.lodUpdates;
         this.lodUpdates = [];
         await worker.call("updateLodTrees", { ranges: lodUpdates });
-        this.lodDirty = true;
+        // Only force re-traversal if the camera actually moved. Pages added
+        // during background prefetch while the camera is idle are discovered
+        // organically on the next camera-driven traversal.
+        if (this._cameraMovedSinceLastTraversal) {
+          this.lodDirty = true;
+        }
       }
 
       if (this.lodDirty) {
@@ -1356,6 +1368,7 @@ export class SparkRenderer extends THREE.Mesh {
           timestamp: now,
         };
         this.lodDirty = false;
+        this._cameraMovedSinceLastTraversal = false;
 
         await this.updateLodInstances(
           worker,
