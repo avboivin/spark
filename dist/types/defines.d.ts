@@ -62,6 +62,7 @@ export type PackedExtra = {
     sh2Codes?: Uint32Array;
     sh3Codes?: Uint32Array;
     lodTree?: Uint32Array;
+    syntheticLodTree?: boolean;
     radMeta?: RadMeta;
 };
 export type PackedResult = {
@@ -79,6 +80,7 @@ export type ExtExtra = {
     sh2Codes?: Uint32Array;
     sh3Codes?: [Uint32Array, Uint32Array];
     lodTree?: Uint32Array;
+    syntheticLodTree?: boolean;
     radMeta?: RadMeta;
 };
 export type ExtResult = {

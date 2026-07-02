@@ -1580,7 +1580,7 @@ export class SplatPager {
       // concurrent fetching happens to place it. (An earlier version of this
       // comment claimed this should use `page` instead -- that was wrong and
       // was reverted; verify against lod_tree.rs before changing this again.)
-      if (extra.lodTree && extra.lodTree.length >= 4) {
+      if (extra.syntheticLodTree && extra.lodTree && extra.lodTree.length >= 4) {
         extra.lodTree[3] = (chunk * PAGE_SPLATS + extra.lodTree[3]) >>> 0;
       }
       console.log(

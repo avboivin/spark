@@ -1,5 +1,5 @@
 import * as fflate from 'fflate';
-import { stable_lexicographic_sort_wasm } from 'spark-rs';
+import { stable_lexicographic_sort_wasm, GsplatArray } from 'spark-rs';
 
 // Helper to convert Float32 to IEEE 754 Float16 bits
 function float32ToHalf(val: number): number {
@@ -297,6 +297,7 @@ export async function convertSplatToSp5Client({
   maxSh,
   onProgress,
   priorityPoint,
+  lodBase,
 }: {
   numSplats: number;
   xyz: Float32Array;
@@ -318,6 +319,7 @@ export async function convertSplatToSp5Client({
   // visible on load already has its data resident instead of a k-d-tree-order
   // region unrelated to what the viewer will actually be looking at.
   priorityPoint?: [number, number, number];
+  lodBase?: number;
 }): Promise<Uint8Array> {
   const CHUNK_SIZE = 65536;
 
@@ -381,39 +383,69 @@ export async function convertSplatToSp5Client({
     }
   }
 
-  // 2. Run k-means codebook generation
+  // 2. Build monolithic GsplatArray and compute LOD tree
+  onProgress?.("Building monolithic LOD tree...", 20);
+  const gsplat = GsplatArray.from_attributes(
+    sortedXyz,
+    sortedOpacity,
+    sortedRgb,
+    sortedScales,
+    sortedQuats,
+    sortedSh1 ? sortedSh1 : undefined
+  );
+  const base = Math.max(1.1, Math.min(2.0, lodBase ?? 1.5));
+  gsplat.tiny_lod(base, false);
+
+  const attrs = gsplat.extract_attributes();
+  const totalNumSplats = gsplat.len();
+
+  const reorderedXyz = new Float32Array(attrs.xyz);
+  const reorderedOpacity = new Float32Array(attrs.opacity);
+  const reorderedRgb = new Float32Array(attrs.rgb);
+  const reorderedScales = new Float32Array(attrs.scales);
+  const reorderedQuats = new Float32Array(attrs.quaternions);
+  const reorderedSh1 = sortedSh1 ? new Float32Array(attrs.sh1) : undefined;
+  const lodTree = gsplat.extract_lod_tree();
+  gsplat.free();
+
+  // 3. Run k-means codebook generation globally on the expanded/reordered attributes
   onProgress?.("Quantizing scale and rotation channels...", 30);
   const scaleChannels = [
-    sortedScales.filter((_, idx) => idx % 3 === 0),
-    sortedScales.filter((_, idx) => idx % 3 === 1),
-    sortedScales.filter((_, idx) => idx % 3 === 2),
+    new Float32Array(totalNumSplats),
+    new Float32Array(totalNumSplats),
+    new Float32Array(totalNumSplats),
   ];
+  for (let i = 0; i < totalNumSplats; i++) {
+    scaleChannels[0][i] = reorderedScales[i * 3 + 0];
+    scaleChannels[1][i] = reorderedScales[i * 3 + 1];
+    scaleChannels[2][i] = reorderedScales[i * 3 + 2];
+  }
   const scaleCodebooks = scaleChannels.map(c => kmeans1d(c, 256));
 
-  const rotSlice0 = new Float32Array(numSplats * 2);
-  const rotSlice1 = new Float32Array(numSplats * 2);
-  for (let i = 0; i < numSplats; i++) {
-    rotSlice0[i * 2 + 0] = sortedQuats[i * 4 + 0];
-    rotSlice0[i * 2 + 1] = sortedQuats[i * 4 + 1];
-    rotSlice1[i * 2 + 0] = sortedQuats[i * 4 + 2];
-    rotSlice1[i * 2 + 1] = sortedQuats[i * 4 + 3];
+  const rotSlice0 = new Float32Array(totalNumSplats * 2);
+  const rotSlice1 = new Float32Array(totalNumSplats * 2);
+  for (let i = 0; i < totalNumSplats; i++) {
+    rotSlice0[i * 2 + 0] = reorderedQuats[i * 4 + 0];
+    rotSlice0[i * 2 + 1] = reorderedQuats[i * 4 + 1];
+    rotSlice1[i * 2 + 0] = reorderedQuats[i * 4 + 2];
+    rotSlice1[i * 2 + 1] = reorderedQuats[i * 4 + 3];
   }
   const rotCodebooks = [
     kmeans2d(rotSlice0, 256),
     kmeans2d(rotSlice1, 256),
   ];
 
-  // Map each splat's properties to the closest codebook indices
+  // 4. Map each splat's properties to the closest codebook indices
   onProgress?.("Mapping indices and building Huffman tables...", 60);
   const scaleIndices = [
-    new Uint8Array(numSplats),
-    new Uint8Array(numSplats),
-    new Uint8Array(numSplats),
+    new Uint8Array(totalNumSplats),
+    new Uint8Array(totalNumSplats),
+    new Uint8Array(totalNumSplats),
   ];
   for (let c = 0; c < 3; c++) {
     const data = scaleChannels[c];
     const cb = scaleCodebooks[c];
-    for (let i = 0; i < numSplats; i++) {
+    for (let i = 0; i < totalNumSplats; i++) {
       const val = data[i];
       let minDist = Infinity, bestIdx = 0;
       for (let j = 0; j < 256; j++) {
@@ -425,10 +457,10 @@ export async function convertSplatToSp5Client({
   }
 
   const rotIndices = [
-    new Uint8Array(numSplats),
-    new Uint8Array(numSplats),
+    new Uint8Array(totalNumSplats),
+    new Uint8Array(totalNumSplats),
   ];
-  for (let i = 0; i < numSplats; i++) {
+  for (let i = 0; i < totalNumSplats; i++) {
     for (let s = 0; s < 2; s++) {
       const slice = s === 0 ? rotSlice0 : rotSlice1;
       const cb = rotCodebooks[s];
@@ -457,83 +489,31 @@ export async function convertSplatToSp5Client({
     return buildHuffmanTable(freq);
   });
 
-  // 3. Packaging into chunks
-  // Partition by actual 3D spatial locality (see kdPartitionIndices above),
-  // not by contiguous ranges of the global (z,y,x) sort order -- the latter
-  // produces degenerate, near-2D chunks whenever the scene's point density is
-  // highly non-uniform (dense building + sparse widely-spread background),
-  // which showed up as "only one direction/slice of the scene visible" and
-  // "95% missing" once loaded, since most chunks ended up covering only a
-  // sub-1-unit-thick horizontal slab of the real content.
-  onProgress?.("Partitioning into spatial chunks...", 75);
-  const allIndices = new Int32Array(numSplats);
-  for (let i = 0; i < numSplats; i++) allIndices[i] = i;
-  const chunkGroups = kdPartitionIndices(allIndices, sortedXyz, CHUNK_SIZE);
-
-  // Chunk 0 is fetched unconditionally, before any LOD tree exists to
-  // discover the rest of the scene -- it's the one region guaranteed to be
-  // visible immediately on load. Left alone, which spatial group lands at
-  // index 0 is just whatever the k-d partition produced first, unrelated to
-  // where a viewer's default camera actually looks. If a priority point was
-  // given, move whichever group's centroid is closest to it into index 0.
-  if (priorityPoint && chunkGroups.length > 1) {
-    const [pcx, pcy, pcz] = [priorityPoint[0] - cx, priorityPoint[1] - cy, priorityPoint[2] - cz];
-    let bestGroup = 0;
-    let bestDist = Infinity;
-    for (let g = 0; g < chunkGroups.length; g++) {
-      const group = chunkGroups[g];
-      let sx = 0, sy = 0, sz = 0;
-      for (let k = 0; k < group.length; k++) {
-        const i = group[k];
-        sx += sortedXyz[i * 3 + 0];
-        sy += sortedXyz[i * 3 + 1];
-        sz += sortedXyz[i * 3 + 2];
-      }
-      const n = group.length;
-      const dx = sx / n - pcx, dy = sy / n - pcy, dz = sz / n - pcz;
-      const dist = dx * dx + dy * dy + dz * dz;
-      if (dist < bestDist) { bestDist = dist; bestGroup = g; }
-    }
-    if (bestGroup !== 0) {
-      [chunkGroups[0], chunkGroups[bestGroup]] = [chunkGroups[bestGroup], chunkGroups[0]];
-    }
-  }
-
-  const numChunks = chunkGroups.length;
+  // 5. Partition/Slice contiguously into chunks of size exactly CHUNK_SIZE = 65536
+  const numChunks = Math.ceil(totalNumSplats / CHUNK_SIZE);
   const zipFiles: Record<string, Uint8Array> = {};
   const chunksManifest: any[] = [];
 
   onProgress?.("Packaging .sp5 chunk files...", 80);
   for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-    const group = chunkGroups[chunkIdx];
-    const count = group.length;
+    const start = chunkIdx * CHUNK_SIZE;
+    const count = Math.min(totalNumSplats - start, CHUNK_SIZE);
 
-    // Chunk arrays, gathered by this group's (spatially local, not
-    // contiguous) set of global-sort-order indices.
-    const chunkXyz = new Float32Array(count * 3);
-    const chunkOpacity = new Float32Array(count);
-    const chunkRgb = new Float32Array(count * 3);
-    const chunkSh1 = sortedSh1 ? new Float32Array(count * 9) : new Float32Array(0);
-    const chunkScaleIndices = [new Uint8Array(count), new Uint8Array(count), new Uint8Array(count)];
-    const chunkRotIndices = [new Uint8Array(count), new Uint8Array(count)];
-    for (let k = 0; k < count; k++) {
-      const i = group[k];
-      chunkXyz[k * 3 + 0] = sortedXyz[i * 3 + 0];
-      chunkXyz[k * 3 + 1] = sortedXyz[i * 3 + 1];
-      chunkXyz[k * 3 + 2] = sortedXyz[i * 3 + 2];
-      chunkOpacity[k] = sortedOpacity[i];
-      chunkRgb[k * 3 + 0] = sortedRgb[i * 3 + 0];
-      chunkRgb[k * 3 + 1] = sortedRgb[i * 3 + 1];
-      chunkRgb[k * 3 + 2] = sortedRgb[i * 3 + 2];
-      if (sortedSh1) {
-        for (let s = 0; s < 9; s++) chunkSh1[k * 9 + s] = sortedSh1[i * 9 + s];
-      }
-      chunkScaleIndices[0][k] = scaleIndices[0][i];
-      chunkScaleIndices[1][k] = scaleIndices[1][i];
-      chunkScaleIndices[2][k] = scaleIndices[2][i];
-      chunkRotIndices[0][k] = rotIndices[0][i];
-      chunkRotIndices[1][k] = rotIndices[1][i];
-    }
+    const chunkXyz = reorderedXyz.subarray(start * 3, (start + count) * 3);
+    const chunkOpacity = reorderedOpacity.subarray(start, start + count);
+    const chunkRgb = reorderedRgb.subarray(start * 3, (start + count) * 3);
+    const chunkSh1 = reorderedSh1 ? reorderedSh1.subarray(start * 9, (start + count) * 9) : new Float32Array(0);
+
+    const chunkScaleIndices = [
+      scaleIndices[0].subarray(start, start + count),
+      scaleIndices[1].subarray(start, start + count),
+      scaleIndices[2].subarray(start, start + count),
+    ];
+    const chunkRotIndices = [
+      rotIndices[0].subarray(start, start + count),
+      rotIndices[1].subarray(start, start + count),
+    ];
+    const lodTreeSlice = lodTree.subarray(start * 4, (start + count) * 4);
 
     // Huffman streams
     const scaleHuffman = chunkScaleIndices.map((ind, c) => encodeHuffman(ind, scaleTables[c]));
@@ -550,6 +530,18 @@ export async function convertSplatToSp5Client({
       padded.set(bytes);
       
       const meta = { offset: currentOffset, length: bytes.length, dtype: "float16", shape: [val.length] };
+      binaryBlobs.push(padded);
+      currentOffset += paddedLength;
+      return meta;
+    }
+
+    function packUint32Array(val: Uint32Array): any {
+      const bytes = new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
+      const paddedLength = (bytes.length + 3) & ~3;
+      const padded = new Uint8Array(paddedLength);
+      padded.set(bytes);
+      
+      const meta = { offset: currentOffset, length: bytes.length, dtype: "uint32", shape: [val.length / 4, 4] };
       binaryBlobs.push(padded);
       currentOffset += paddedLength;
       return meta;
@@ -613,6 +605,9 @@ export async function convertSplatToSp5Client({
     chunkMeta.mlp_dc = packArray(chunkRgb);
     chunkMeta.mlp_sh = packArray(chunkSh1);
 
+    // Pack the lod_tree
+    chunkMeta.lod_tree = packUint32Array(lodTreeSlice);
+
     // Serialize JSON header
     const jsonStr = JSON.stringify(chunkMeta);
     const jsonBytes = new TextEncoder().encode(jsonStr);
@@ -655,9 +650,9 @@ export async function convertSplatToSp5Client({
   const globalManifest = {
     version: 5,
     type: "sp5",
-    count: numSplats,
+    count: totalNumSplats,
     maxSh,
-    lodTree: false,
+    lodTree: true,
     chunkSize: CHUNK_SIZE,
     chunks: chunksManifest
   };

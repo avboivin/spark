@@ -1370,19 +1370,162 @@ async function decodeSp5Chunk({
         }`,
     );
 
-    synthesizeFlatLodTreeIfMissing(
-      result,
-      count,
-      (i) => [
-        xyzRawFloat[i * 3 + 0],
-        xyzRawFloat[i * 3 + 1],
-        xyzRawFloat[i * 3 + 2],
-      ],
-      siblingChunks,
-    );
+    if (manifest.lod_tree) {
+      const lodTreeBytes = getBinaryPart(manifest.lod_tree);
+      let alignedBytes = lodTreeBytes;
+      if (lodTreeBytes.byteOffset % 4 !== 0) {
+        alignedBytes = new Uint8Array(lodTreeBytes.length);
+        alignedBytes.set(lodTreeBytes);
+      }
+      const rawLodTree = new Uint32Array(
+        alignedBytes.buffer,
+        alignedBytes.byteOffset,
+        alignedBytes.byteLength / 4,
+      );
+
+      if (siblingChunks && siblingChunks.length > 0) {
+        result.extra.lodTree = stitchRealLodTreeWithSiblings(rawLodTree, siblingChunks);
+      } else {
+        result.extra.lodTree = rawLodTree;
+      }
+      result.extra.syntheticLodTree = false;
+    } else {
+      result.extra.syntheticLodTree = true;
+      synthesizeFlatLodTreeIfMissing(
+        result,
+        count,
+        (i) => [
+          xyzRawFloat[i * 3 + 0],
+          xyzRawFloat[i * 3 + 1],
+          xyzRawFloat[i * 3 + 2],
+        ],
+        siblingChunks,
+      );
+    }
   }
 
   return result;
+}
+
+function stitchRealLodTreeWithSiblings(
+  lodTree: Uint32Array,
+  siblingChunks: { chunkIndex: number; center: [number, number, number]; size: number }[],
+): Uint32Array {
+  const originalNodesCount = lodTree.length / 4;
+  const numSiblings = siblingChunks.length;
+  const shiftAmount = 1 + numSiblings;
+  const totalEntries = shiftAmount + originalNodesCount;
+  
+  const newLodTree = new Uint32Array(totalEntries * 4);
+  
+  // Calculate the bounding box of the entire scene (Chunk 0 + all siblings)
+  // to size the Virtual Root.
+  // First, get Chunk 0's bounds from its original root node (at index 0 of lodTree)
+  const cx0 = halfToFloat(lodTree[0] & 0xffff);
+  const cy0 = halfToFloat((lodTree[0] >>> 16) & 0xffff);
+  const cz0 = halfToFloat(lodTree[1] & 0xffff);
+  const size0 = halfToFloat((lodTree[1] >>> 16) & 0xffff);
+  
+  let minX = cx0 - size0, maxX = cx0 + size0;
+  let minY = cy0 - size0, maxY = cy0 + size0;
+  let minZ = cz0 - size0, maxZ = cz0 + size0;
+  
+  for (let s = 0; s < numSiblings; s++) {
+    const sib = siblingChunks[s];
+    const sx = sib.center[0], sy = sib.center[1], sz = sib.center[2];
+    const sSize = sib.size;
+    if (sx - sSize < minX) minX = sx - sSize;
+    if (sx + sSize > maxX) maxX = sx + sSize;
+    if (sy - sSize < minY) minY = sy - sSize;
+    if (sy + sSize > maxY) maxY = sy + sSize;
+    if (sz - sSize < minZ) minZ = sz - sSize;
+    if (sz + sSize > maxZ) maxZ = sz + sSize;
+  }
+  
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const cz = (minZ + maxZ) / 2;
+  const diag = Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+  const nominalSize = Math.max(diag / 2, 1e-4);
+  
+  const writeEntry = (
+    dest: Uint32Array,
+    idx: number,
+    ex: number, ey: number, ez: number,
+    size: number,
+    childCount: number,
+    childStart: number,
+  ) => {
+    const o = idx * 4;
+    dest[o + 0] = (float32ToHalfBits(ex) & 0xffff) | ((float32ToHalfBits(ey) & 0xffff) << 16);
+    dest[o + 1] = (float32ToHalfBits(ez) & 0xffff) | ((float32ToHalfBits(size) & 0xffff) << 16);
+    dest[o + 2] = childCount & 0xffff;
+    dest[o + 3] = childStart >>> 0;
+  };
+  
+  // 1. Write the Virtual Root at index 0.
+  // Its children are: Chunk 0's real root (at offset 1) + all sibling pointers (at offsets 2..2+numSiblings-1).
+  // Total children = 1 + numSiblings.
+  writeEntry(newLodTree, 0, cx, cy, cz, nominalSize, 1 + numSiblings, 1);
+  
+  // 2. Write Chunk 0's real root at index 1.
+  // Copy fields from original index 0, but shift its child_start.
+  // Original real root's child_start was origRootStart.
+  // Since all other original nodes (indices 1..originalNodesCount-1) are shifted to:
+  // 1 + numSiblings + (i - 1) = i + numSiblings,
+  // the new child_start is:
+  // - If child_count > 0, origRootStart + numSiblings
+  // - If child_count == 0, 0.
+  const origRootCount = lodTree[2] & 0xffff;
+  const origRootStart = lodTree[3];
+  let newRootStart = 0;
+  if (origRootCount > 0) {
+    newRootStart = (origRootStart >> 16) === 0 ? (origRootStart + shiftAmount) : origRootStart;
+  }
+  newLodTree[4] = lodTree[0];
+  newLodTree[5] = lodTree[1];
+  newLodTree[6] = origRootCount & 0xffff;
+  newLodTree[7] = newRootStart >>> 0;
+  
+  // 3. Write sibling pointers at index 2 .. 2 + numSiblings - 1.
+  for (let s = 0; s < numSiblings; s++) {
+    const sib = siblingChunks[s];
+    const absoluteChildStart = ((sib.chunkIndex << 16) | 0) >>> 0;
+    writeEntry(
+      newLodTree,
+      2 + s,
+      sib.center[0],
+      sib.center[1],
+      sib.center[2],
+      sib.size,
+      1,
+      absoluteChildStart,
+    );
+  }
+  
+  // 4. Copy the remaining original nodes to:
+  // index 2 + numSiblings .. 2 + numSiblings + originalNodesCount - 2.
+  // And shift their child_start values by 1 + numSiblings.
+  for (let i = 1; i < originalNodesCount; i++) {
+    const srcO = i * 4;
+    const destO = (i + shiftAmount) * 4;
+    
+    newLodTree[destO + 0] = lodTree[srcO + 0];
+    newLodTree[destO + 1] = lodTree[srcO + 1];
+    
+    const childCount = lodTree[srcO + 2] & 0xffff;
+    const childStart = lodTree[srcO + 3];
+    
+    let newChildStart = 0;
+    if (childCount > 0) {
+      newChildStart = (childStart >> 16) === 0 ? (childStart + shiftAmount) : childStart;
+    }
+    
+    newLodTree[destO + 2] = childCount & 0xffff;
+    newLodTree[destO + 3] = newChildStart >>> 0;
+  }
+  
+  return newLodTree;
 }
 
 // Root-cause fix for the traverse_lod_trees panic ("index out of bounds: the

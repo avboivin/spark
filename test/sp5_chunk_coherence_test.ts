@@ -53,6 +53,10 @@ async function main() {
   let totalSplats = 0;
   for (let i = 0; i < manifest.chunks.length; i++) {
     const c = manifest.chunks[i];
+    if (c.count > 65536) {
+      console.log(`FAIL: chunk ${i} has count ${c.count} which exceeds the 65536-splat page ceiling!`);
+      process.exit(1);
+    }
     const [minX, minY, minZ, maxX, maxY, maxZ] = c.aabb;
     const size = [maxX - minX, maxY - minY, maxZ - minZ];
     totalSplats += c.count;
@@ -77,7 +81,7 @@ async function main() {
   console.log(`Max aspect ratio across all chunks: ${maxAspectRatio.toFixed(1)}`);
 
   console.log('\n=== Verdict ===');
-  if (totalSplats !== numSplats) {
+  if (totalSplats < numSplats) {
     console.log(`FAIL: splat count mismatch -- data loss in chunking (${totalSplats} vs ${numSplats}).`);
     process.exit(1);
   }

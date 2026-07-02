@@ -6,6 +6,7 @@ use spark_lib::gsplat::GsplatArray as GsplatArrayInner;
 use spark_lib::csplat::CsplatArray as CsplatArrayInner;
 use spark_lib::tsplat::{TsplatArray, Tsplat, TsplatMut};
 use wasm_bindgen::prelude::*;
+use half::f16;
 
 use crate::ext_splats::ExtSplatsData;
 use crate::{decoder::ChunkDecoder, packed_splats::PackedSplatsData};
@@ -382,6 +383,102 @@ impl GsplatArray {
             quaternions,
             sh1,
         }
+    }
+
+    pub fn from_attributes(
+        xyz: &[f32],
+        opacity: &[f32],
+        rgb: &[f32],
+        scales: &[f32],
+        quaternions: &[f32],
+        sh1: Option<Float32Array>,
+    ) -> Result<GsplatArray, JsValue> {
+        let num_points = opacity.len();
+        if xyz.len() != num_points * 3 {
+            return Err(JsValue::from_str("Invalid xyz array length"));
+        }
+        if rgb.len() != num_points * 3 {
+            return Err(JsValue::from_str("Invalid rgb array length"));
+        }
+        if scales.len() != num_points * 3 {
+            return Err(JsValue::from_str("Invalid scales array length"));
+        }
+        if quaternions.len() != num_points * 4 {
+            return Err(JsValue::from_str("Invalid quaternions array length"));
+        }
+
+        let max_sh_degree = if sh1.is_some() { 1 } else { 0 };
+        let mut inner = GsplatArrayInner::new_capacity(num_points, max_sh_degree);
+
+        for i in 0..num_points {
+            let center = glam::Vec3A::new(xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]);
+            let op = opacity[i];
+            let color = glam::Vec3A::new(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]);
+            let s_val = glam::Vec3A::new(scales[i * 3], scales[i * 3 + 1], scales[i * 3 + 2]);
+            let q = glam::Quat::from_xyzw(quaternions[i * 4], quaternions[i * 4 + 1], quaternions[i * 4 + 2], quaternions[i * 4 + 3]);
+            
+            let splat = spark_lib::gsplat::Gsplat::new(center, op, color, s_val, q);
+            inner.splats.push(splat);
+        }
+
+        if let Some(sh1_arr) = sh1 {
+            let sh1_vec = sh1_arr.to_vec();
+            if sh1_vec.len() != num_points * 9 {
+                return Err(JsValue::from_str("Invalid sh1 array length"));
+            }
+            for i in 0..num_points {
+                let offset = i * 9;
+                let mut sh = [[half::f16::ZERO; 3]; 3];
+                for row in 0..3 {
+                    for col in 0..3 {
+                        sh[row][col] = half::f16::from_f32(sh1_vec[offset + row * 3 + col]);
+                    }
+                }
+                inner.sh1.push(spark_lib::gsplat::GsplatSH1(sh));
+            }
+        }
+
+        Ok(GsplatArray::new(inner))
+    }
+
+    pub fn extract_lod_tree(&self) -> Result<Uint32Array, JsValue> {
+        let num_points = self.inner.len();
+        let out = Uint32Array::new_with_length((num_points * 4) as u32);
+        
+        let mut buffer = vec![0u32; num_points * 4];
+        
+        for i in 0..num_points {
+            let splat = self.inner.get(i);
+            let center = splat.center();
+            let opacity = splat.opacity();
+            let scales = splat.scales();
+            let (child_count, child_start) = self.inner.get_child_count_start(i);
+            
+            let clamp_center_coord = |val: f32| -> f32 {
+                val.clamp(-65504.0, 65504.0)
+            };
+            
+            let center_f16: [f16; 3] = [
+                f16::from_f32(clamp_center_coord(center[0])),
+                f16::from_f32(clamp_center_coord(center[1])),
+                f16::from_f32(clamp_center_coord(center[2])),
+            ];
+            let avg_scale = (scales[0] + scales[1] + scales[2]) / 3.0;
+            let expansion = if opacity <= 1.0 { 1.0 } else {
+                let a = opacity * 4.0 - 3.0;
+                1.0 + 0.7 * (a - 1.0)
+            };
+            let size = f16::from_f32(clamp_center_coord(2.0 * expansion * avg_scale));
+            
+            let i4 = i * 4;
+            buffer[i4 + 0] = (center_f16[0].to_bits() as u32) | ((center_f16[1].to_bits() as u32) << 16);
+            buffer[i4 + 1] = (center_f16[2].to_bits() as u32) | ((size.to_bits() as u32) << 16);
+            buffer[i4 + 2] = (child_count as u32) & 0xffff;
+            buffer[i4 + 3] = child_start as u32;
+        }
+        
+        out.copy_from(&buffer);
+        Ok(out)
     }
 }
 
