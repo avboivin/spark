@@ -163,6 +163,8 @@ struct LodState {
     touched: Vec<(u32, u32)>,
     touched_set: AHashSet<(u32, u32)>,
     buffer: Vec<u32>,
+    last_expanded: AHashSet<(u32, u32)>,
+    current_expanded: AHashSet<(u32, u32)>,
 }
 
 impl LodState {
@@ -175,6 +177,8 @@ impl LodState {
             touched: Vec::new(),
             touched_set: AHashSet::new(),
             buffer: Vec::new(),
+            last_expanded: AHashSet::new(),
+            current_expanded: AHashSet::new(),
         }
     }
 }
@@ -282,6 +286,8 @@ pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array) -> Result<Object, J
 pub fn dispose_lod_tree(lod_id: u32) {
     STATE.with_borrow_mut(|state| {
         state.lod_trees.remove(&lod_id);
+        state.last_expanded.retain(|&(id, _)| id != lod_id);
+        state.current_expanded.retain(|&(id, _)| id != lod_id);
     })
 }
 
@@ -408,6 +414,23 @@ pub fn get_lod_tree_level(lod_id: u32, level: u32) -> anyhow::Result<Object, JsV
     })
 }
 
+fn should_expand(
+    lod_id: u32,
+    paged_index: u32,
+    pixel_scale: f32,
+    refine_limit: f32,
+    coarsen_limit: f32,
+    last_expanded: &AHashSet<(u32, u32)>,
+) -> bool {
+    if pixel_scale > coarsen_limit {
+        true
+    } else if pixel_scale <= refine_limit {
+        false
+    } else {
+        last_expanded.contains(&(lod_id, paged_index))
+    }
+}
+
 #[wasm_bindgen]
 pub fn traverse_lod_trees(
     max_splats: u32, pixel_scale_limit: f32, _last_pixel_limit: Option<f32>,
@@ -438,7 +461,7 @@ pub fn traverse_lod_trees(
     }
 
     STATE.with_borrow_mut(|state| {
-        let LodState { lod_trees, frontier, output, touched, touched_set, .. } = state;
+        let LodState { lod_trees, frontier, output, touched, touched_set, last_expanded, current_expanded, .. } = state;
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
             let LodTree { splats, page_to_chunk, chunk_to_page } = &lod_tree;
@@ -478,14 +501,25 @@ pub fn traverse_lod_trees(
         let mut min_pixel_scale = f32::INFINITY;
         let mut leaf_count = 0;
 
+        let refine_limit = pixel_scale_limit * 0.9;
+        let coarsen_limit = pixel_scale_limit * 1.15;
+
         while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index)) = frontier.peek() {
             min_pixel_scale = min_pixel_scale.min(pixel_scale);
-            if pixel_scale <= pixel_scale_limit {
+            if pixel_scale <= refine_limit {
                 break;
             }
 
             let instance = &instances[inst_index as usize];
             let (lod_id, splats, _page_to_chunk, chunk_to_page, ..) = instance;
+
+            let is_expanded = should_expand(*lod_id, paged_index, pixel_scale, refine_limit, coarsen_limit, last_expanded);
+            if !is_expanded {
+                _ = frontier.pop();
+                output.push((inst_index, paged_index));
+                continue;
+            }
+
             let LodSplat { child_count, child_start, .. } = splats[paged_index as usize];
 
             if child_count == 0 {
@@ -524,15 +558,18 @@ pub fn traverse_lod_trees(
                 continue;
             }
 
+            current_expanded.insert((*lod_id, paged_index));
+
             for child in child_start..child_start + child_count as u32 {
                 let child_chunk = (child >> 16) as usize;
                 let child_page = chunk_to_page[child_chunk];
-                let paged_index = (child_page << 16) | (child & 0xffff);
-                let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
-                if pixel_scale <= pixel_scale_limit {
-                    output.push((inst_index, paged_index));
+                let child_paged_index = (child_page << 16) | (child & 0xffff);
+                let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
+                let child_expand = should_expand(*lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
+                if !child_expand {
+                    output.push((inst_index, child_paged_index));
                 } else {
-                    frontier.push((OrderedFloat(pixel_scale), inst_index, paged_index));
+                    frontier.push((OrderedFloat(child_pixel_scale), inst_index, child_paged_index));
                 }
             }
 
@@ -594,6 +631,9 @@ pub fn traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
+
+        std::mem::swap(last_expanded, current_expanded);
+        current_expanded.clear();
         Ok(result)
     })
 }
@@ -662,7 +702,7 @@ pub fn dynamic_traverse_lod_trees(
     }
 
     STATE.with_borrow_mut(|state| {
-        let LodState { lod_trees, .. } = state;
+        let LodState { lod_trees, last_expanded, current_expanded, .. } = state;
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
             let LodTree { splats, page_to_chunk, chunk_to_page } = &lod_tree;
@@ -717,7 +757,10 @@ pub fn dynamic_traverse_lod_trees(
 
                 while let Some((paged_index, pixel_scale)) = stack.pop() {
                     min_pixel_scale = min_pixel_scale.min(pixel_scale);
-                    if pixel_scale <= current_scale {
+                    let refine_limit = current_scale * 0.9;
+                    let coarsen_limit = current_scale * 1.15;
+                    let is_expanded = should_expand(*lod_id, paged_index, pixel_scale, refine_limit, coarsen_limit, last_expanded);
+                    if !is_expanded {
                         frontier.push((paged_index, pixel_scale));
                         continue;
                     }
@@ -751,20 +794,25 @@ pub fn dynamic_traverse_lod_trees(
                         missing_count += 1;
                         continue;
                     }
+
+                    current_expanded.insert((*lod_id, paged_index));
         
                     for child in child_start..child_start + child_count as u32 {
                         let child_chunk = (child >> 16) as usize;
                         let child_page = chunk_to_page[child_chunk];
-                        let paged_index = (child_page << 16) | (child & 0xffff);
-                        let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
-                        if pixel_scale <= current_scale {
-                            if pixel_scale <= pixel_scale_limit {
-                                instance_output.push((paged_index, pixel_scale));
+                        let child_paged_index = (child_page << 16) | (child & 0xffff);
+                        let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
+                        let refine_limit = current_scale * 0.9;
+                        let coarsen_limit = current_scale * 1.15;
+                        let child_expand = should_expand(*lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
+                        if !child_expand {
+                            if child_pixel_scale <= pixel_scale_limit {
+                                instance_output.push((child_paged_index, child_pixel_scale));
                             } else {
-                                frontier.push((paged_index, pixel_scale));
+                                frontier.push((child_paged_index, child_pixel_scale));
                             }
                         } else {
-                            stack.push((paged_index, pixel_scale));
+                            stack.push((child_paged_index, child_pixel_scale));
                         }
                     }
                 }
@@ -838,6 +886,9 @@ pub fn dynamic_traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
         Reflect::set(&result, &JsValue::from_str("missingCount"), &JsValue::from(missing_count)).unwrap();
+
+        std::mem::swap(last_expanded, current_expanded);
+        current_expanded.clear();
         Ok(result)
     })
 }
