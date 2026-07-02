@@ -321,15 +321,26 @@ export async function convertSplatToSp5Client({
 
   // 3. Run k-means codebook generation globally on the expanded/reordered attributes
   onProgress?.("Quantizing scale and rotation channels...", 30);
+  // Cluster in LOG space, not linear. Since Phase 1's monolithic tiny_lod tree mixes
+  // ordinary leaf splats (scale ~0.01-10 typically) with merged/coarse LOD parent
+  // splats (scale can run 10-20x+ larger, representing whole merged regions) into
+  // this SAME 256-entry codebook, linear k-means initializes/settles centroids
+  // spread across the FULL combined range -- starving the dense leaf population
+  // (the vast majority of what's actually rendered up close) of codebook resolution
+  // and forcing many unrelated leaf scales to collide onto the same few centroids.
+  // Clustering in log space (matching the .ln() this value receives on decode
+  // anyway) gives proportional resolution to both populations regardless of their
+  // absolute magnitude gap. Codebook values are exponentiated back to linear before
+  // being written out, so the on-disk format and decode side are unchanged.
   const scaleChannels = [
     new Float32Array(totalNumSplats),
     new Float32Array(totalNumSplats),
     new Float32Array(totalNumSplats),
   ];
   for (let i = 0; i < totalNumSplats; i++) {
-    scaleChannels[0][i] = reorderedScales[i * 3 + 0];
-    scaleChannels[1][i] = reorderedScales[i * 3 + 1];
-    scaleChannels[2][i] = reorderedScales[i * 3 + 2];
+    scaleChannels[0][i] = Math.log(Math.max(reorderedScales[i * 3 + 0], 1e-8));
+    scaleChannels[1][i] = Math.log(Math.max(reorderedScales[i * 3 + 1], 1e-8));
+    scaleChannels[2][i] = Math.log(Math.max(reorderedScales[i * 3 + 2], 1e-8));
   }
   const scaleCodebooks = scaleChannels.map(c => kmeans1d(c, 256));
 
@@ -364,6 +375,14 @@ export async function convertSplatToSp5Client({
         if (dist < minDist) { minDist = dist; bestIdx = j; }
       }
       scaleIndices[c][i] = bestIdx;
+    }
+  }
+  // Codebook clustering/assignment above happened in log space; convert centroids
+  // back to linear before they're written to disk (reconstruct_sp5_chunk expects
+  // linear scale_codebook values and applies its own single .ln()).
+  for (let c = 0; c < 3; c++) {
+    for (let j = 0; j < 256; j++) {
+      scaleCodebooks[c][j] = Math.exp(scaleCodebooks[c][j]);
     }
   }
 
@@ -410,7 +429,38 @@ export async function convertSplatToSp5Client({
     const start = chunkIdx * CHUNK_SIZE;
     const count = Math.min(totalNumSplats - start, CHUNK_SIZE);
 
-    const chunkXyz = reorderedXyz.subarray(start * 3, (start + count) * 3);
+    const chunkXyzRaw = reorderedXyz.subarray(start * 3, (start + count) * 3);
+    // Positions are stored as float16, which hard-clamps at +/-65504. Chunks are no
+    // longer small spatial regions -- since Phase 1's monolithic-tree-then-slice
+    // change, chunk 0 (and other coarse BFS-order chunks) can span the ENTIRE scene
+    // (hundreds of thousands of world units for outdoor/GPS-scale captures). Packing
+    // that range directly in f16 pins most positions to the clamp boundary, collapsing
+    // the coarsest LOD level onto a handful of points -- exactly the "poisoned bbox"
+    // corruption class fixed earlier for the .ply path, but re-introduced here because
+    // this xyz_uncompressed encoding never adopted the .ply path's adaptive-precision
+    // approach (SPZ's per-chunk fractional-bits fixed point). Fix: normalize each
+    // chunk's positions into its own local [-F16_SAFE_MAX, F16_SAFE_MAX] range before
+    // packing, and store the chunk's center/scale so the decoder can invert it.
+    const F16_SAFE_MAX = 60000;
+    let cMinX = Infinity, cMinY = Infinity, cMinZ = Infinity;
+    let cMaxX = -Infinity, cMaxY = -Infinity, cMaxZ = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const x = chunkXyzRaw[i * 3 + 0], y = chunkXyzRaw[i * 3 + 1], z = chunkXyzRaw[i * 3 + 2];
+      if (x < cMinX) cMinX = x; if (x > cMaxX) cMaxX = x;
+      if (y < cMinY) cMinY = y; if (y > cMaxY) cMaxY = y;
+      if (z < cMinZ) cMinZ = z; if (z > cMaxZ) cMaxZ = z;
+    }
+    const chunkCenter: [number, number, number] = count > 0
+      ? [(cMinX + cMaxX) / 2, (cMinY + cMaxY) / 2, (cMinZ + cMaxZ) / 2]
+      : [0, 0, 0];
+    const halfExtent = count > 0 ? Math.max(cMaxX - cMinX, cMaxY - cMinY, cMaxZ - cMinZ) / 2 : 0;
+    const chunkScale = Math.max(halfExtent, 1e-6) / F16_SAFE_MAX;
+    const chunkXyz = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      chunkXyz[i * 3 + 0] = (chunkXyzRaw[i * 3 + 0] - chunkCenter[0]) / chunkScale;
+      chunkXyz[i * 3 + 1] = (chunkXyzRaw[i * 3 + 1] - chunkCenter[1]) / chunkScale;
+      chunkXyz[i * 3 + 2] = (chunkXyzRaw[i * 3 + 2] - chunkCenter[2]) / chunkScale;
+    }
     const chunkOpacity = reorderedOpacity.subarray(start, start + count);
     const chunkRgb = reorderedRgb.subarray(start * 3, (start + count) * 3);
     const chunkSh1 = reorderedSh1 ? reorderedSh1.subarray(start * 9, (start + count) * 9) : new Float32Array(0);
@@ -488,8 +538,10 @@ export async function convertSplatToSp5Client({
       mlp_offset: {}
     };
 
-    // Positions (uncompressed)
+    // Positions (uncompressed, chunk-local-normalized -- see chunkXyz comment above)
     chunkMeta.xyz_uncompressed = packArray(chunkXyz);
+    chunkMeta.chunk_center = chunkCenter;
+    chunkMeta.chunk_scale = chunkScale;
 
     // Codebooks
     scaleCodebooks.forEach(cb => {
@@ -543,9 +595,9 @@ export async function convertSplatToSp5Client({
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     for (let i = 0; i < count; i++) {
-      const x = chunkXyz[i * 3 + 0];
-      const y = chunkXyz[i * 3 + 1];
-      const z = chunkXyz[i * 3 + 2];
+      const x = chunkXyzRaw[i * 3 + 0];
+      const y = chunkXyzRaw[i * 3 + 1];
+      const z = chunkXyzRaw[i * 3 + 2];
       if (x < minX) minX = x; if (x > maxX) maxX = x;
       if (y < minY) minY = y; if (y > maxY) maxY = y;
       if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
