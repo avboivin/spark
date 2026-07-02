@@ -401,12 +401,15 @@ export class SparkRenderer extends THREE.Mesh {
   lodWorker: SplatWorker | null = null;
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
-  // Tracks whether the camera moved since the last traversal — used to
-  // throttle re-traversals triggered by background chunk uploads. When
-  // false, new pages are added to the WASM tree silently and discovered
-  // on the next camera-driven traversal instead of forcing a full
-  // re-traversal (~300ms) for every upload.
+  // Upload-driven traversal throttle: when the camera is stationary, at most
+  // one re-traversal is allowed to pick up newly uploaded pages. Subsequent
+  // uploads accumulate silently in the tree and are discovered on the next
+  // camera-driven traversal. This prevents ~300ms traversal bursts for every
+  // background chunk upload (87 × 300ms = 26s on MRNF10k), while still
+  // showing the user the first batch of content without requiring camera
+  // movement.
   _cameraMovedSinceLastTraversal = true;
+  _uploadDrivenTraversalDone = false;
   lodIds: Map<
     PackedSplats | ExtSplats | PagedSplats,
     { lodId: number; lastTouched: number; rootPage?: number }
@@ -1207,6 +1210,7 @@ export class SparkRenderer extends THREE.Mesh {
       if (similarity < 0.999) {
         this.lodDirty = true;
         this._cameraMovedSinceLastTraversal = true;
+        this._uploadDrivenTraversalDone = false;
       }
     }
 
@@ -1342,11 +1346,16 @@ export class SparkRenderer extends THREE.Mesh {
         const lodUpdates = this.lodUpdates;
         this.lodUpdates = [];
         await worker.call("updateLodTrees", { ranges: lodUpdates });
-        // Only force re-traversal if the camera actually moved. Pages added
-        // during background prefetch while the camera is idle are discovered
-        // organically on the next camera-driven traversal.
+        // Throttle upload-driven traversals: if the camera hasn't moved,
+        // allow exactly one follow-up traversal to pick up newly uploaded
+        // content (so the user sees SOMETHING without shaking the camera),
+        // then defer until the camera actually moves.
         if (this._cameraMovedSinceLastTraversal) {
           this.lodDirty = true;
+          this._uploadDrivenTraversalDone = false;
+        } else if (!this._uploadDrivenTraversalDone) {
+          this.lodDirty = true;
+          this._uploadDrivenTraversalDone = true;
         }
       }
 
