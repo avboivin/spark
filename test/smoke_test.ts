@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import init_wasm, { decode_to_gsplatarray, reconstruct_sp5_chunk } from '../rust/spark-rs/pkg/spark_rs.js';
+import init_wasm, { decode_to_gsplatarray, reconstruct_sp5_chunk, decode_huffman_fast } from '../rust/spark-rs/pkg/spark_rs.js';
 import { convertSplatToSp5Client } from '../src/converter.js';
+import { decodeHuffman, decodeHuffmanJsFallback, type HuffmanTable } from '../src/huffman_decode.js';
 import * as fflate from 'fflate';
 
 async function main() {
@@ -113,36 +114,8 @@ async function main() {
       return binaryPayload.subarray(meta.offset, meta.offset + meta.length);
     }
 
-    // Decode Huffman indices
-    function decodeHuffman(bytes: Uint8Array, htable: Record<string, [number, number]>, count: number) {
-      const table = new Map<string, number>();
-      for (const [symbol, [len, bits]] of Object.entries(htable)) {
-        table.set(`${bits},${len}`, parseInt(symbol));
-      }
-      const out = new Uint16Array(count);
-      let outIdx = 0;
-      let currentBits = 0;
-      let currentLen = 0;
-      let byteIdx = 0;
-      let bitIdx = 7;
-      while (outIdx < count && byteIdx < bytes.length) {
-        const bit = (bytes[byteIdx] >> bitIdx) & 1;
-        bitIdx--;
-        if (bitIdx < 0) {
-          bitIdx = 7;
-          byteIdx++;
-        }
-        currentBits = (currentBits << 1) | bit;
-        currentLen++;
-        const key = `${currentBits},${currentLen}`;
-        if (table.has(key)) {
-          out[outIdx++] = table.get(key)!;
-          currentBits = 0;
-          currentLen = 0;
-        }
-      }
-      return out;
-    }
+    const _decodeH = (bytes: Uint8Array, htable: HuffmanTable, count: number) =>
+      decodeHuffman(bytes, htable, count, decode_huffman_fast as any);
 
     const count = chunkMeta.count;
     const xyzBytes = getBinaryPart(chunkMeta.xyz_uncompressed);
@@ -150,19 +123,19 @@ async function main() {
 
     const scaleIndices: number[] = [];
     for (const hmeta of chunkMeta.scale_index_huffman) {
-      const decoded = decodeHuffman(getBinaryPart(hmeta), hmeta.huffman_table, count);
+      const decoded = _decodeH(getBinaryPart(hmeta), hmeta.huffman_table, count);
       for (let i = 0; i < count; i++) scaleIndices.push(decoded[i]);
     }
 
     const rotationIndices: number[] = [];
     for (const hmeta of chunkMeta.rotation_index_huffman) {
-      const decoded = decodeHuffman(getBinaryPart(hmeta), hmeta.huffman_table, count);
+      const decoded = _decodeH(getBinaryPart(hmeta), hmeta.huffman_table, count);
       for (let i = 0; i < count; i++) rotationIndices.push(decoded[i]);
     }
 
     const appIndices: number[] = [];
     for (const hmeta of chunkMeta.app_index_huffman) {
-      const decoded = decodeHuffman(getBinaryPart(hmeta), hmeta.huffman_table, count);
+      const decoded = _decodeH(getBinaryPart(hmeta), hmeta.huffman_table, count);
       for (let i = 0; i < count; i++) appIndices.push(decoded[i]);
     }
 

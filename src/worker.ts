@@ -22,6 +22,7 @@ import init_wasm, {
   decode_huffman_fast,
 } from "spark-rs";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
+import { decodeHuffman } from "./huffman_decode";
 
 const rpcHandlers = {
   sortSplats16,
@@ -1187,69 +1188,17 @@ export async function decodeSp5Chunk({
   // halfToFloat moved to module scope (used by both decodeSp5Chunk and
   // loadPackedSplats's flat-lod-tree synthesis, see synthesizeFlatLodTreeIfMissing below).
 
-  // Cache prefix lookup tables per Huffman table to avoid rebuilding
-  // on every chunk decode (tables are shared across all chunks).
-  const _huffmanLutCache = new Map<Record<string, [number, number]>, Uint16Array>();
+  // Cache prefix lookup tables per Huffman table (now in shared huffman_decode.ts).
+  // The local decodeHuffman delegates to the shared implementation with the
+  // WASM function injected, so smoke_test.ts and sp5_ordering_test.ts can use
+  // the identical decode path.
 
-  function decodeHuffman(
+  function decodeHuffmanLocal(
     bytes: Uint8Array,
     htable: Record<string, [number, number]>,
     count: number,
   ) {
-    let lut = _huffmanLutCache.get(htable);
-    if (!lut) {
-      let maxLen = 0;
-      const entries: [number, number, number][] = [];
-      for (const [symStr, [len, bits]] of Object.entries(htable)) {
-        const sym = Number.parseInt(symStr);
-        entries.push([sym, len, bits]);
-        if (len > maxLen) maxLen = len;
-      }
-      if (maxLen > 16) {
-        // Fallback: codes > 16 bits use the JS bit-loop
-        const fallbackTable = new Map<string, number>();
-        for (const [s, l, b] of entries) fallbackTable.set(`${b},${l}`, s);
-        const fallbackLut = new Uint16Array(0);
-        (fallbackLut as any)._fallback = fallbackTable;
-        _huffmanLutCache.set(htable, fallbackLut);
-        lut = fallbackLut;
-      } else {
-        const lutSize = 1 << maxLen;
-        lut = new Uint16Array(lutSize);
-        lut.fill(0xFFFF);
-        const shift = maxLen;
-        for (const [symbol, len, bits] of entries) {
-          const spread = 1 << (shift - len);
-          const base = bits << (shift - len);
-          for (let i = 0; i < spread; i++) {
-            lut[base + i] = ((len << 8) | symbol) as number;
-          }
-        }
-        _huffmanLutCache.set(htable, lut);
-      }
-    }
-
-    const fallbackTable = (lut as any)._fallback as Map<string, number> | undefined;
-    if (fallbackTable) {
-      const out = new Uint16Array(count);
-      let outIdx = 0, currentBits = 0, currentLen = 0, byteIdx = 0, bitIdx = 7;
-      while (outIdx < count && byteIdx < bytes.length) {
-        const bit = (bytes[byteIdx] >> bitIdx) & 1;
-        bitIdx--; if (bitIdx < 0) { bitIdx = 7; byteIdx++; }
-        currentBits = (currentBits << 1) | bit; currentLen++;
-        const key = `${currentBits},${currentLen}`;
-        if (fallbackTable.has(key)) { out[outIdx++] = fallbackTable.get(key)!; currentBits = 0; currentLen = 0; }
-      }
-      return out;
-    }
-
-    // Copy bytes to avoid detaching the shared binaryPayload ArrayBuffer
-    // when wasm-bindgen accesses the memory.
-    const bytesCopy = bytes.slice();
-    const decoded = decode_huffman_fast(bytesCopy, lut, count);
-    const out = new Uint16Array(count);
-    out.set(decoded.subarray(0, Math.min(decoded.length, count)));
-    return out;
+    return decodeHuffman(bytes, htable, count, decode_huffman_fast as any);
   }
 
   function getBinaryPart(meta: { offset: number; length: number }) {
@@ -1259,21 +1208,21 @@ export async function decodeSp5Chunk({
   const scaleIndices: number[] = [];
   for (const hmeta of manifest.scale_index_huffman) {
     const hBytes = getBinaryPart(hmeta);
-    const decoded = decodeHuffman(hBytes, hmeta.huffman_table, count);
+    const decoded = decodeHuffmanLocal(hBytes, hmeta.huffman_table, count);
     for (let i = 0; i < count; i++) scaleIndices.push(decoded[i]);
   }
 
   const rotationIndices: number[] = [];
   for (const hmeta of manifest.rotation_index_huffman) {
     const hBytes = getBinaryPart(hmeta);
-    const decoded = decodeHuffman(hBytes, hmeta.huffman_table, count);
+    const decoded = decodeHuffmanLocal(hBytes, hmeta.huffman_table, count);
     for (let i = 0; i < count; i++) rotationIndices.push(decoded[i]);
   }
 
   const appIndices: number[] = [];
   for (const hmeta of manifest.app_index_huffman) {
     const hBytes = getBinaryPart(hmeta);
-    const decoded = decodeHuffman(hBytes, hmeta.huffman_table, count);
+    const decoded = decodeHuffmanLocal(hBytes, hmeta.huffman_table, count);
     for (let i = 0; i < count; i++) appIndices.push(decoded[i]);
   }
   const huffmanEnd = performance.now();

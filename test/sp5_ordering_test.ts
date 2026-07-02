@@ -22,8 +22,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import init_wasm, { decode_to_gsplatarray, reconstruct_sp5_chunk } from '../rust/spark-rs/pkg/spark_rs.js';
+import init_wasm, { decode_to_gsplatarray, reconstruct_sp5_chunk, decode_huffman_fast } from '../rust/spark-rs/pkg/spark_rs.js';
 import { convertSplatToSp5Client } from '../src/converter.js';
+import { decodeHuffman, type HuffmanTable } from '../src/huffman_decode.js';
 import * as fflate from 'fflate';
 
 function halfToFloat(binary: number): number {
@@ -41,22 +42,8 @@ function float16ArrayToFloat32Array(bytes: Uint8Array): Float32Array {
   for (let i = 0; i < u16.length; i++) out[i] = halfToFloat(u16[i]);
   return out;
 }
-function decodeHuffman(bytes: Uint8Array, htable: Record<string, [number, number]>, count: number): Uint16Array {
-  const table = new Map<string, number>();
-  for (const [symbol, [len, bits]] of Object.entries(htable)) table.set(`${bits},${len}`, Number.parseInt(symbol));
-  const out = new Uint16Array(count);
-  let outIdx = 0, currentBits = 0, currentLen = 0, byteIdx = 0, bitIdx = 7;
-  while (outIdx < count && byteIdx < bytes.length) {
-    const bit = (bytes[byteIdx] >> bitIdx) & 1;
-    bitIdx--;
-    if (bitIdx < 0) { bitIdx = 7; byteIdx++; }
-    currentBits = (currentBits << 1) | bit;
-    currentLen++;
-    const key = `${currentBits},${currentLen}`;
-    if (table.has(key)) { out[outIdx++] = table.get(key)!; currentBits = 0; currentLen = 0; }
-  }
-  return out;
-}
+const _decodeH = (bytes: Uint8Array, htable: HuffmanTable, count: number) =>
+  decodeHuffman(bytes, htable, count, decode_huffman_fast as any);
 
 async function main() {
   const wasmPath = path.resolve('./rust/spark-rs/pkg/spark_rs_bg.wasm');
@@ -129,20 +116,47 @@ async function main() {
 
     const count = chunkMeta.count;
     const xyzRawFloat = float16ArrayToFloat32Array(getBin(chunkMeta.xyz_uncompressed));
+    // Positions are now chunk-local-normalized (see converter.ts's chunkXyz comment) --
+    // undo it the same way worker.ts's decodeSp5Chunk does, or nearest-position
+    // matching below compares two different coordinate systems and is meaningless.
+    const chunkCenter: [number, number, number] = chunkMeta.chunk_center ?? [0, 0, 0];
+    const chunkScale: number = chunkMeta.chunk_scale ?? 1;
+    for (let i = 0; i < count; i++) {
+      xyzRawFloat[i * 3 + 0] = xyzRawFloat[i * 3 + 0] * chunkScale + chunkCenter[0];
+      xyzRawFloat[i * 3 + 1] = xyzRawFloat[i * 3 + 1] * chunkScale + chunkCenter[1];
+      xyzRawFloat[i * 3 + 2] = xyzRawFloat[i * 3 + 2] * chunkScale + chunkCenter[2];
+    }
+
+    // The real LOD tree now mixes in merged/coarse parent splats (tiny_lod's
+    // synthetic representatives) alongside original leaf splats. A merged node's
+    // scale legitimately has no relationship to any single nearby original
+    // point's scale, so only leaves (child_count === 0) are meaningful to check
+    // here -- node index i in lod_tree corresponds 1:1 with attribute index i.
+    let lodTreeRaw: Uint32Array | undefined;
+    if (chunkMeta.lod_tree) {
+      let lodTreeBytes = getBin(chunkMeta.lod_tree);
+      if (lodTreeBytes.byteOffset % 4 !== 0) {
+        const aligned = new Uint8Array(lodTreeBytes.length);
+        aligned.set(lodTreeBytes);
+        lodTreeBytes = aligned;
+      }
+      lodTreeRaw = new Uint32Array(lodTreeBytes.buffer, lodTreeBytes.byteOffset, lodTreeBytes.byteLength / 4);
+    }
+    const isLeaf = (i: number) => !lodTreeRaw || lodTreeRaw[i * 4 + 2] === 0;
 
     const scaleIndices: number[] = [];
     for (const hmeta of chunkMeta.scale_index_huffman) {
-      const d = decodeHuffman(getBin(hmeta), hmeta.huffman_table, count);
+      const d = _decodeH(getBin(hmeta), hmeta.huffman_table, count);
       for (let i = 0; i < count; i++) scaleIndices.push(d[i]);
     }
     const rotationIndices: number[] = [];
     for (const hmeta of chunkMeta.rotation_index_huffman) {
-      const d = decodeHuffman(getBin(hmeta), hmeta.huffman_table, count);
+      const d = _decodeH(getBin(hmeta), hmeta.huffman_table, count);
       for (let i = 0; i < count; i++) rotationIndices.push(d[i]);
     }
     const appIndices: number[] = [];
     for (const hmeta of chunkMeta.app_index_huffman) {
-      const d = decodeHuffman(getBin(hmeta), hmeta.huffman_table, count);
+      const d = _decodeH(getBin(hmeta), hmeta.huffman_table, count);
       for (let i = 0; i < count; i++) appIndices.push(d[i]);
     }
 
@@ -170,7 +184,12 @@ async function main() {
     const rScales = new Float32Array(rAttrs.scales);
     reconstructed.free();
 
+    let leafN = 0, nonLeafN = 0;
+    for (let i = 0; i < count; i++) { if (isLeaf(i)) leafN++; else nonLeafN++; }
+    console.log(`  chunk ${chunkInfo.file}: count=${count}, leaves=${leafN}, non-leaf=${nonLeafN}`);
+
     for (let i = 0; i < count; i++) {
+      if (!isLeaf(i)) continue; // merged/coarse nodes have no single "original" point to compare against
       const dx = rXyz[i * 3 + 0], dy = rXyz[i * 3 + 1], dz = rXyz[i * 3 + 2];
       const decodedScale = rScales[i * 3 + 0]; // x-channel; all 3 channels equal by construction
 
@@ -188,17 +207,21 @@ async function main() {
 
       const expectedScale = originalScaleForIndex[bestIdx];
       checked++;
-      // Codebook has 256 levels spread over [0.01, 10.01] -> step ~0.039.
-      // Allow generous tolerance (1 codebook step + some slack) for legitimate
-      // quantization error; anything beyond that means the decoded scale came
-      // from a DIFFERENT point's codebook index, not this point's.
-      const tolerance = (10.0 / 256) * 3;
+      // The scale codebook is now built in LOG space over the combined leaf +
+      // merged-LOD-node population (see converter.ts's scaleChannels comment),
+      // so its resolution at any given leaf's magnitude is roughly proportional
+      // to that magnitude, not a fixed linear step across [0.01, 10.01]. Use a
+      // relative tolerance (with a small absolute floor for near-zero values);
+      // a genuine mispairing bug produces errors of 100%+ (an unrelated splat's
+      // scale), far beyond legitimate quantization noise.
+      const tolerance = Math.max(0.05, expectedScale * 0.08);
       if (Math.abs(decodedScale - expectedScale) > tolerance) {
         mismatches++;
         if (mismatchExamples.length < 10) {
+          const childCount = lodTreeRaw ? lodTreeRaw[i * 4 + 2] : -1;
           mismatchExamples.push(
-            `  decoded point at (${dx.toFixed(2)},${dy.toFixed(2)},${dz.toFixed(2)}) matched original #${bestIdx} ` +
-              `(expected scale ${expectedScale.toFixed(4)}) but decoded scale is ${decodedScale.toFixed(4)}`,
+            `  slot i=${i} childCount=${childCount} decoded point at (${dx.toFixed(2)},${dy.toFixed(2)},${dz.toFixed(2)}) matched original #${bestIdx} ` +
+              `(expected scale ${expectedScale.toFixed(4)}, dist=${Math.sqrt(bestDist).toFixed(4)}) but decoded scale is ${decodedScale.toFixed(4)}`,
           );
         }
       }
