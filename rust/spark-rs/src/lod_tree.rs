@@ -1053,3 +1053,167 @@ pub fn dynamic_traverse_lod_trees(
         Ok(result)
     })
 }
+
+/// P2a — Incremental LOD cut repair (ROAM-style split-only variant).
+/// Re-keys only nodes in the current cut (~0.7% churn per frame) instead of
+/// the full tree, builds a split queue from nodes now above threshold, and
+/// returns deltas. Falls back to full traversal on cold start or large jumps.
+#[wasm_bindgen]
+pub fn repair_lod_cut(
+    max_splats: u32, pixel_scale_limit: f32,
+    lod_ids: &[u32], root_pages: &[u32],
+    view_to_objects: &[f32], lod_scales: &[f32],
+    behind_foveates: &[f32], cone_foveates: &[f32],
+    cone_fov0s: &[f32], cone_fovs: &[f32],
+    page_bounds: Option<Box<[f32]>>,
+) -> anyhow::Result<Object, JsValue> {
+    let max_splats = max_splats as usize;
+    let num_instances = lod_ids.len();
+    let refine_limit = pixel_scale_limit * 0.9;
+    let coarsen_limit = pixel_scale_limit * 1.15;
+
+    STATE.with_borrow_mut(|state| {
+        let LodState { lod_trees, last_expanded, current_expanded, .. } = state;
+        let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
+            let lod_tree = lod_trees.get(&lod_id).unwrap();
+            let LodTree { splats, page_to_chunk, chunk_to_page } = &lod_tree;
+            let i16 = index * 16;
+            let forward = Vec3A::from_slice(&view_to_objects[(i16 + 8)..(i16 + 11)]).normalize().map(|x| -x);
+            let origin = Vec3A::from_slice(&view_to_objects[(i16 + 12)..(i16 + 15)]);
+            let lod_scale = lod_scales[index];
+            let behind_foveate = behind_foveates[index];
+            let cone_foveate = cone_foveates[index];
+            let cone_dot0 = if cone_fov0s[index] > 0.0 { (0.5 * cone_fov0s[index]).to_radians().cos() } else { 1.0 };
+            let cone_dot = if cone_fovs[index] > 0.0 { (0.5 * cone_fovs[index]).to_radians().cos() } else { 1.0 };
+            let cone_dot = cone_dot.min(cone_dot0);
+            (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot)
+        }).collect();
+
+        let old_cuts = std::mem::take(&mut state.cut_nodes);
+        state.cut_nodes.resize(num_instances, AHashMap::new());
+        state.cut_delta_added.resize(num_instances, Vec::new());
+        state.cut_delta_removed.resize(num_instances, Vec::new());
+
+        let mut needs_full = old_cuts.is_empty() || old_cuts.len() < num_instances;
+        if !needs_full {
+            for inst in 0..num_instances {
+                if old_cuts[inst].is_empty() { needs_full = true; break; }
+                if state.last_cut_origins.len() > inst {
+                    let d = instances[inst].4.distance(state.last_cut_origins[inst]);
+                    let dot = instances[inst].5.dot(state.last_cut_forwards[inst]);
+                    if d > 1.0 || (1.0 - dot).abs() > 0.004 { needs_full = true; break; }
+                }
+            }
+        }
+
+        if needs_full {
+            let result = Object::new();
+            Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(Array::new())).unwrap();
+            Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(Array::new())).unwrap();
+            Reflect::set(&result, &JsValue::from_str("needsFull"), &JsValue::from(true)).unwrap();
+            return Ok(result);
+        }
+
+        let mut output_sets: Vec<Vec<(u32, f32)>> = (0..num_instances).map(|_| Vec::new()).collect();
+        let mut touched_list: Vec<(u32, u32)> = Vec::new();
+        let mut touched_set: AHashSet<(u32, u32)> = AHashSet::new();
+
+        for (inst_index, instance) in instances.iter().enumerate() {
+            let (lod_id, splats, _, chunk_to_page, ..) = instance;
+            let mut split_q: Vec<(OrderedFloat<f32>, u32)> = Vec::new();
+            for (&paged_index, _) in old_cuts[inst_index].iter() {
+                let ps = compute_pixel_scale(&splats[paged_index as usize], instance);
+                state.cut_nodes[inst_index].insert(paged_index, ps);
+                if ps > coarsen_limit && splats[paged_index as usize].child_count > 0 {
+                    split_q.push((OrderedFloat(ps), paged_index));
+                }
+            }
+            split_q.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+            let mut instance_output: Vec<(u32, f32)> = Vec::new();
+            for &(OrderedFloat(ps), paged_index) in split_q.iter() {
+                if ps <= coarsen_limit { break; }
+                let node = &splats[paged_index as usize];
+                if node.child_count == 0 { continue; }
+                let last_chunk = (node.child_start + node.child_count as u32 - 1) >> 16;
+                if last_chunk as usize >= chunk_to_page.len() { continue; }
+                let first_page = chunk_to_page[(node.child_start >> 16) as usize];
+                let last_page = chunk_to_page[last_chunk as usize];
+                if first_page == 0xFFFFFFFF || last_page == 0xFFFFFFFF { continue; }
+                let first_chunk = node.child_start >> 16;
+                if touched_set.insert((*lod_id, first_chunk)) { touched_list.push((*lod_id, first_chunk)); }
+                if last_chunk != first_chunk && touched_set.insert((*lod_id, last_chunk)) { touched_list.push((*lod_id, last_chunk)); }
+                state.cut_nodes[inst_index].remove(&paged_index);
+                current_expanded.insert((inst_index as u32, *lod_id, paged_index));
+                for child in node.child_start..node.child_start + node.child_count as u32 {
+                    let child_pi = (chunk_to_page[(child >> 16) as usize] << 16) | (child & 0xffff);
+                    let child_ps = compute_pixel_scale(&splats[child_pi as usize], instance);
+                    let child_exp = should_expand(inst_index as u32, *lod_id, child_pi, child_ps, refine_limit, coarsen_limit, last_expanded);
+                    if child_exp { instance_output.push((child_pi, child_ps)); }
+                    else { state.cut_nodes[inst_index].insert(child_pi, child_ps); }
+                }
+            }
+            for (&paged_index, _) in old_cuts[inst_index].iter() {
+                if state.cut_nodes[inst_index].contains_key(&paged_index) {
+                    instance_output.push((paged_index, state.cut_nodes[inst_index][&paged_index]));
+                }
+            }
+            output_sets[inst_index] = instance_output;
+            state.last_cut_origins[inst_index] = instance.4;
+            state.last_cut_forwards[inst_index] = instance.5;
+            state.last_cut_limits[inst_index] = pixel_scale_limit;
+        }
+
+        for inst in 0..num_instances {
+            let limit = (max_splats / num_instances).max(1);
+            while output_sets[inst].len() > limit {
+                output_sets[inst].sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((pi, _)) = output_sets[inst].pop() { state.cut_nodes[inst].remove(&pi); }
+            }
+        }
+
+        for inst in 0..num_instances {
+            state.cut_delta_added[inst].clear();
+            state.cut_delta_removed[inst].clear();
+            let mut new_set = AHashSet::with_capacity(output_sets[inst].len());
+            for &(pi, _) in output_sets[inst].iter() { new_set.insert(pi); }
+            if inst < old_cuts.len() {
+                for &(pi, _) in output_sets[inst].iter() { if !old_cuts[inst].contains_key(&pi) { state.cut_delta_added[inst].push(pi); } }
+                for (&pi, _) in old_cuts[inst].iter() { if !new_set.contains(&pi) { state.cut_delta_removed[inst].push(pi); } }
+            }
+        }
+
+        let instance_indices = Array::new();
+        for inst in 0..num_instances {
+            let rows = output_sets[inst].len().div_ceil(16384);
+            let indices: Vec<u32> = output_sets[inst].iter().map(|(pi, _)| *pi).collect();
+            let output = Uint32Array::new_with_length((rows * 16384) as u32);
+            output.subarray(0, indices.len() as u32).copy_from(&indices);
+            let r = Object::new();
+            Reflect::set(&r, &JsValue::from_str("lodId"), &JsValue::from(instances[inst].0)).unwrap();
+            Reflect::set(&r, &JsValue::from_str("numSplats"), &JsValue::from(indices.len() as u32)).unwrap();
+            Reflect::set(&r, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
+            instance_indices.push(&JsValue::from(r));
+        }
+
+        let out_chunks = Array::new();
+        for &(lod_id, chunk) in touched_list.iter() {
+            let pair = Array::new(); pair.push(&JsValue::from(lod_id)); pair.push(&JsValue::from(chunk));
+            out_chunks.push(&JsValue::from(pair));
+        }
+        let d_added = Array::new(); let d_removed = Array::new();
+        for inst in 0..num_instances {
+            d_added.push(&JsValue::from(Uint32Array::from(state.cut_delta_added[inst].as_slice())));
+            d_removed.push(&JsValue::from(Uint32Array::from(state.cut_delta_removed[inst].as_slice())));
+        }
+        let result = Object::new();
+        Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(instance_indices)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(out_chunks)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("cutDeltaAdded"), &JsValue::from(d_added)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("cutDeltaRemoved"), &JsValue::from(d_removed)).unwrap();
+
+        std::mem::swap(last_expanded, current_expanded);
+        current_expanded.clear();
+        Ok(result)
+    })
+}
