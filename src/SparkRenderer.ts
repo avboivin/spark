@@ -412,6 +412,7 @@ export class SparkRenderer extends THREE.Mesh {
   _cameraMovedSinceLastTraversal = true;
   _lastUploadDrivenTraversalTime = 0;
   _pagesUploadedSinceLastTraversal = 0;
+  _hasCut = false;  // P2a: set after first full traversal seeds the cut
   lodIds: Map<
     PackedSplats | ExtSplats | PagedSplats,
     { lodId: number; lastTouched: number; rootPage?: number }
@@ -1575,28 +1576,58 @@ export class SparkRenderer extends THREE.Mesh {
     }
 
     const traverseStart = performance.now();
-    const result = (await worker.call("traverseLodTrees", {
-      maxSplats,
-      pixelScaleLimit,
-      lastPixelLimit: this.lastPixelLimit,
-      instances,
-      traverseMode: this.lodTraverseMode,
-      // Slice to prevent getTransferable from detaching the shared buffer;
-      // the raycast traverse below also needs it live.
-      pageBounds: pageBounds?.slice(),
-    })) as {
-      keyIndices: Record<
-        string,
-        { lodId: number; numSplats: number; indices: Uint32Array }
-      >;
+
+    // P2a: Try incremental cut repair before full traversal. Falls back to
+    // full traverse_lod_trees on cold start (no cut yet), camera teleport,
+    // or non-additive page changes. The incremental path re-keys only ~0.7%
+    // of nodes (the churn) instead of the full O(N) tree.
+    let result: {
+      keyIndices: Record<string, { lodId: number; numSplats: number; indices: Uint32Array }>;
       chunks: [number, number][];
       pixelLimit?: number;
     };
+    let usedIncremental = false;
+
+    if (this._hasCut && this._cameraMovedSinceLastTraversal) {
+      // Camera moved within incremental repair band — try repair first
+      const repairResult = await worker.call("repairLodCut", {
+        maxSplats,
+        pixelScaleLimit,
+        lastPixelLimit: this.lastPixelLimit,
+        instances,
+        pageBounds: pageBounds?.slice(),
+      }) as {
+        needsFull?: boolean;
+        keyIndices: Record<string, { lodId: number; numSplats: number; indices: Uint32Array }>;
+        chunks: [number, number][];
+        cutDeltaAdded?: Uint32Array[];
+        cutDeltaRemoved?: Uint32Array[];
+      };
+      if (repairResult.needsFull) {
+        result = (await worker.call("traverseLodTrees", {
+          maxSplats, pixelScaleLimit, lastPixelLimit: this.lastPixelLimit,
+          instances, traverseMode: this.lodTraverseMode,
+          pageBounds: pageBounds?.slice(),
+        })) as any;
+      } else {
+        result = repairResult;
+        usedIncremental = true;
+      }
+    } else {
+      this._hasCut = true; // first full traversal seeds the cut
+      result = (await worker.call("traverseLodTrees", {
+        maxSplats, pixelScaleLimit, lastPixelLimit: this.lastPixelLimit,
+        instances, traverseMode: this.lodTraverseMode,
+        pageBounds: pageBounds?.slice(),
+      })) as any;
+    }
+
     const traverseElapsed = performance.now() - traverseStart;
     this.lastTraverseTime = traverseElapsed;
+    const modeLabel = usedIncremental ? "repair" : "full";
     if (traverseElapsed > 50) {
       console.warn(
-        `[perf-stall] traverseLodTrees RPC = ${traverseElapsed.toFixed(1)}ms ` +
+        `[perf-stall] ${modeLabel} traverse RPC = ${traverseElapsed.toFixed(1)}ms ` +
         `(maxSplats=${maxSplats}, pixelScaleLimit=${pixelScaleLimit.toExponential(2)})`,
       );
     }
