@@ -10,6 +10,7 @@ import init_wasm, {
   dispose_lod_tree,
   traverse_lod_trees,
   dynamic_traverse_lod_trees,
+  repair_lod_cut,
   type ChunkDecoder,
   tiny_lod_packedsplats,
   bhatt_lod_packedsplats,
@@ -39,6 +40,7 @@ const rpcHandlers = {
   disposeLodTree,
   updateLodTrees,
   traverseLodTrees,
+  repairLodCut,
   getLodTreeLevel,
   partitionDroppedMonolithic,
   decodeSp5Chunk,
@@ -861,6 +863,53 @@ function traverseLodTrees({
     keyIndices: indices,
     chunks,
     pixelLimit,
+  };
+}
+
+function repairLodCut({
+  maxSplats, pixelScaleLimit, lastPixelLimit, instances, pageBounds,
+}: {
+  maxSplats: number; pixelScaleLimit: number; lastPixelLimit?: number;
+  instances: Record<string, {
+    instanceId: string; lodId: number; rootPage?: number;
+    viewToObjectCols: number[]; lodScale: number;
+    behindFoveate: number; coneFov0: number; coneFov: number; coneFoveate: number;
+  }>;
+  pageBounds?: Float32Array;
+}) {
+  const keyInstances = Object.entries(instances);
+  const lodIds = new Uint32Array(keyInstances.map(([, i]) => i.lodId));
+  const rootPages = new Uint32Array(keyInstances.map(([, i]) => i.rootPage ?? 0xffffffff));
+  const viewToObjects = new Float32Array(keyInstances.flatMap(([, i]) => i.viewToObjectCols));
+  const lodScales = new Float32Array(keyInstances.map(([, i]) => i.lodScale));
+  const behindFoveates = new Float32Array(keyInstances.map(([, i]) => i.behindFoveate));
+  const coneFov0s = new Float32Array(keyInstances.map(([, i]) => i.coneFov0));
+  const coneFovs = new Float32Array(keyInstances.map(([, i]) => i.coneFov));
+  const coneFoveates = new Float32Array(keyInstances.map(([, i]) => i.coneFoveate));
+
+  const result = repair_lod_cut(
+    maxSplats, pixelScaleLimit,
+    lodIds, rootPages, viewToObjects, lodScales,
+    behindFoveates, coneFoveates, coneFov0s, coneFovs,
+    pageBounds ?? new Float32Array(0),
+  ) as any;
+
+  // Check if repair fell back to needing a full traversal
+  if (result.needsFull) {
+    return { needsFull: true };
+  }
+
+  const { instanceIndices, chunks } = result;
+  const indices = keyInstances.reduce((acc, [key], index) => {
+    acc[key] = instanceIndices[index];
+    return acc;
+  }, {} as Record<string, { lodId: number; numSplats: number; indices: Uint32Array }>);
+
+  return {
+    keyIndices: indices,
+    chunks,
+    cutDeltaAdded: result.cutDeltaAdded as Uint32Array[],
+    cutDeltaRemoved: result.cutDeltaRemoved as Uint32Array[],
   };
 }
 

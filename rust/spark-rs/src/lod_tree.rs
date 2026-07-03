@@ -170,6 +170,9 @@ struct LodState {
     // node in the current LOD cut. Populated by traverse_lod_trees as
     // the seed; updated incrementally by repair_lod_cut.
     cut_nodes: Vec<AHashMap<u32, f32>>,
+    // P2a parent map: child paged_index → parent paged_index, populated
+    // during full traversal and used by repair_lod_cut's merge queue.
+    parent_map: Vec<AHashMap<u32, u32>>,
     // Last full-cut seed parameters — when the camera moves far enough
     // that incremental repair is unreliable, fall back to full traversal.
     last_cut_origins: Vec<Vec3A>,
@@ -193,6 +196,7 @@ impl LodState {
             last_expanded: AHashSet::new(),
             current_expanded: AHashSet::new(),
             cut_nodes: Vec::new(),
+            parent_map: Vec::new(),
             last_cut_origins: Vec::new(),
             last_cut_forwards: Vec::new(),
             last_cut_limits: Vec::new(),
@@ -643,6 +647,11 @@ pub fn traverse_lod_trees(
                     continue;
                 }
                 let child_paged_index = (child_page << 16) | (child & 0xffff);
+                // P2a: record parent→child mapping for merge-queue coarsening
+                if inst_index as usize >= state.parent_map.len() {
+                    state.parent_map.resize(inst_index as usize + 1, AHashMap::new());
+                }
+                state.parent_map[inst_index as usize].insert(child_paged_index, paged_index);
                 let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
                 let child_expand = should_expand(inst_index, *lod_id, child_paged_index, child_pixel_scale, refine_limit, coarsen_limit, last_expanded);
                 if !child_expand {
@@ -1162,6 +1171,50 @@ pub fn repair_lod_cut(
             state.last_cut_origins[inst_index] = instance.4;
             state.last_cut_forwards[inst_index] = instance.5;
             state.last_cut_limits[inst_index] = pixel_scale_limit;
+        }
+
+        // P2a Merge step: coarsen sibling groups whose parent falls below
+        // refine_limit. Groups children by parent using parent_map, then
+        // replaces complete sibling sets with their parent.
+        for (inst_index, instance) in instances.iter().enumerate() {
+            let (lod_id, splats, _, chunk_to_page, ..) = instance;
+            // Group output nodes by parent
+            let mut parent_children: AHashMap<u32, Vec<u32>> = AHashMap::new();
+            for &(pi, _) in output_sets[inst_index].iter() {
+                if inst_index < state.parent_map.len() {
+                    if let Some(&parent_pi) = state.parent_map[inst_index].get(&pi) {
+                        parent_children.entry(parent_pi).or_default().push(pi);
+                    }
+                }
+            }
+            for (&parent_pi, children) in parent_children.iter() {
+                let parent_node = &splats[parent_pi as usize];
+                if parent_node.child_count == 0 { continue; }
+                if children.len() as u16 != parent_node.child_count { continue; }
+                // All siblings present: check if parent should replace them
+                let parent_ps = if let Some(&ps) = state.cut_nodes[inst_index].get(&parent_pi) {
+                    ps
+                } else {
+                    compute_pixel_scale(&splats[parent_pi as usize], instance)
+                };
+                if parent_ps > refine_limit { continue; }
+                // Check residency
+                let last_chunk = (parent_node.child_start + parent_node.child_count as u32 - 1) >> 16;
+                if last_chunk as usize >= chunk_to_page.len() { continue; }
+                let first_page = chunk_to_page[(parent_node.child_start >> 16) as usize];
+                if first_page == 0xFFFFFFFF { continue; }
+                // Merge: remove children, add parent
+                for &child_pi in children.iter() {
+                    state.cut_nodes[inst_index].remove(&child_pi);
+                }
+                state.cut_nodes[inst_index].insert(parent_pi, parent_ps);
+                current_expanded.remove(&(inst_index as u32, *lod_id, parent_pi));
+            }
+            // Rebuild output_sets after merge
+            output_sets[inst_index].clear();
+            for (&pi, &ps) in state.cut_nodes[inst_index].iter() {
+                output_sets[inst_index].push((pi, ps));
+            }
         }
 
         for inst in 0..num_instances {
