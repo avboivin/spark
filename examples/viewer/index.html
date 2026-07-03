@@ -304,6 +304,7 @@
 
     let _lastFrameTime = 0;
     let _frameLogThrottle = 0;
+    let _idleLastRenderTime = 0;
 
     // — FPS counter (exponential moving average) —
     const fpsEl = document.getElementById('fps-counter');
@@ -355,12 +356,14 @@
         const cls = _fpsAvg < 15 ? 'bad' : _fpsAvg < 30 ? 'low' : '';
         fpsEl.className = 'fps-counter' + (cls ? ' ' + cls : '');
       }
-      // Render-on-demand: only call renderer.render() when the scene changed.
-      // When the camera is stationary and all chunks are loaded, the GPU idles.
-      // The update logic (driveLod/driveSort) runs via the explicit spark.update()
-      // call below, independent of rendering.
-      spark.update({ scene, camera });
-      if (spark.needsRender()) {
+      // Render-on-demand: renderer.render() is the only path that runs the
+      // camera-similarity-driven update logic (onBeforeRender → updateInternal).
+      // Skipping it entirely freezes the LOD/update pipeline. Instead, throttle
+      // to max 2fps when the scene is settled, full rate when anything changed.
+      const needsRender = spark.needsRender();
+      const IDLE_RENDER_INTERVAL_MS = 500;
+      if (needsRender || time - (_idleLastRenderTime ?? 0) > IDLE_RENDER_INTERVAL_MS) {
+        if (!needsRender) _idleLastRenderTime = time;
         spark.markRendered();
         renderer.render(scene, camera);
       }
