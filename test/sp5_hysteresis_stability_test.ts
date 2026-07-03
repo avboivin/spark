@@ -104,6 +104,17 @@ async function main() {
   for (let step = 0; step < steps; step++) {
     const theta = step * dTheta;
     const indices = runTraverse(theta);
+
+    // Regression: verify no consumer-visible bits set in [31:24] of output
+    // indices (P2b reverted). Bits [31:24] broke pagesInCut and
+    // pagedSplatTexCoord (index >> 16 → negative → out-of-bounds).
+    if (step === 0) {
+      for (const idx of indices) {
+        if ((idx >>> 24) !== 0) {
+          throw new Error(`P2b regression: output index 0x${idx.toString(16)} has bits [31:24] set`);
+        }
+      }
+    }
     
     if (step > 0) {
       const prevSet = new Set(prevIndices);
