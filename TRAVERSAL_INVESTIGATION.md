@@ -1078,3 +1078,69 @@ Huffman decode at 46.6ms avg (5 streams × 9.3ms each). WASM reconstruct at 28.7
 | P3c | Track C2 MLP appearance | ❌ |
 | P3d | Convert-time importance pruning | ❌ |
 
+---
+
+# APPENDIX B — Log Analysis 2026-07-03 (MRNF10k, 3070 Ti, Background Prefetch ON)
+
+> **Scene:** MRNF10k-sp5.zip (5M gaussians, ~87 chunks)
+> **Hardware:** i7-12700K / 3070 Ti / 32GB
+> **Settings:** lodSplatCount=5M, pixelThreshold=1.0px, backgroundPrefetch=ON
+
+### B.1 Raw Metrics
+
+| Metric | Prefetch OFF (App A) | Prefetch ON (App B) | Delta |
+|---|---|---|---|
+| Startup | **1075ms** | **4801ms** | **4.5× slower** |
+| Traversal count | 119 | 76 | -36% |
+| Traversal avg | 233ms | 231ms | ~same |
+| Frame avg | 117.6ms | 125.3ms | +7% |
+| Frame p99 | 188ms | **352ms** | **1.9× worse** |
+| Huffman decode | 46.6ms | 46.8ms | ~same |
+| Freeable max | 9 | 6 | better |
+| ARRIVE→DONE #1 | 2.9s | 3.5s | +21% |
+| ARRIVE→DONE #2 | 7.9s | 4.5s | -43% |
+| ARRIVE→DONE #3 | 11.2s | 9.3s | -17% |
+
+### B.2 Critical Findings
+
+**1. Background prefetch kills startup.**
+4801ms startup vs 1075ms without prefetch. The prefetcher enqueues 87 chunk fetches immediately after manifest parse, saturating all 3 decode workers. The camera-fit poll must wait for the decode queue to drain enough to produce a non-empty bounding box. **Mobile impact: catastrophic.** A phone with 2-4× slower CPU would see 10-20s startup with prefetch ON. Fix: defer prefetch until after camera-fit completes (trivial — move the prefetch loop start to after `onSplatLoad` settles).
+
+**2. The 352ms p99 frame is the "glitchy/hiccupy" source.**
+Frame time p99 = 352ms (1.9× worse than without prefetch). The 351.8ms frame at 12:53:41 corresponds to a 147ms traversal + 3 GPU page uploads (6ms) + driveSort/readback/accumulator work. Each 100-350ms stall is a visible hitch. **Mobile impact:** on a phone where traversal costs 2× more, a single stall would be 500-700ms — a full freeze.
+
+**3. With 5M budget, traversal still dominates frame time.**
+MaxSplats=5,000,000 (user selected "5M" in dropdown). The traversal produces ~1.3M output splats at 1.3px threshold. Each traversal costs 231ms avg. At 2fps idle render cadence during loading, every rendered frame includes a traversal → every frame stalls. **The render loop is: 231ms traversal + 16ms render + ~70ms other work = 320ms total ≈ 3fps.** This is the fundamental cadence problem — until P2a incremental repair is wired end-to-end, every traversal costs O(N_resident).
+
+**4. Fetch queue saturation with prefetch.**
+With prefetch ON, `driveFetchers` enqueues 3 chunks every ~500ms (the 3-worker limit). Each chunk takes 47ms decode + 30ms WASM reconstruct + queue latency. After all 87 chunks are fetched, the queue drains and traversals stop. The `freeable` max of 6 (vs 9 without prefetch) suggests the prefetch loads chunks in a more cache-friendly order, reducing page pool pressure.
+
+**5. 5M budget is excessive for this scene.**
+The MRNF10k scene has a tight ±2K extent. At 1.0px threshold, ~1.3M splats pass the pixel_scale limit. With 5M budget, ALL visible splats are selected — there's no LOD culling. Dropping to 500K (P3a mobile target) would select the top 500K by pixel_scale, which at this scene scale would look nearly identical because the 1.3M-to-500K difference is dominated by far-field tiny splats that contribute negligible visual detail.
+
+### B.3 Mobile Readiness Assessment
+
+| Metric | Desktop (3070 Ti) | Phone est. (S22) | Gap |
+|---|---|---|---|
+| Traversal cost | 231ms | **~500ms** | 2-3× slower CPU |
+| Frame time | 125ms | **~300ms** | Unusable |
+| Startup (prefetch OFF) | 1075ms | ~2.5s | Acceptable |
+| Decode per chunk | 47+30ms | ~100+60ms | 2× slower |
+| GPU render (1.3M splats) | ~16ms | ~40ms | 2-3× slower |
+| GPU idle power | 10-15% | ~25-35% | Thermal concern |
+
+**Phone is not viable until:**
+1. P2a incremental repair wired end-to-end (traversal: 231ms → <10ms)
+2. P3a mobile budget applied (splats: 1.3M → 500K, GPU: 16ms → 5ms)
+3. Prefetch deferred until after camera-fit
+
+### B.4 Action Items (next implementation)
+
+| Priority | Item | Expected Impact |
+|---|---|---|
+| **P0 fix** | Defer background prefetch until camera-fit settles | Startup 4801ms → ~1100ms |
+| **P0 fix** | Cap `fetchPriority` bursts during prefetch (max 3 active, queue rest) | Eliminates fetch queue saturation |
+| **P3a** | Mobile budget knob: lodSplatCount→500K default, pixelThreshold→1.5px | Traversal: 231ms → ~100ms, GPU: 16ms → ~5ms |
+| **P3a** | Adaptive splat budget based on scene extent | Automatic for small scenes like MRNF10k |
+| **P3b** | Distance-banded SH degree (SH3→SH0 with distance) | Resident SH memory: 450MB → ~50MB |
+| **P3c** | Track C2 MLP encoder (Flux-GS model export) | Wire format: 280MB → ~80MB |
