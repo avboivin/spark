@@ -359,6 +359,9 @@ export class SparkRenderer extends THREE.Mesh {
   updateTimeoutId = -1;
   onDirty?: () => void;
   dirty: boolean;
+  // Render-on-demand: true when the scene needs re-rendering (camera moved,
+  // LOD updated, sort completed, or new pages uploaded). Reset after render.
+  _needsRender = true;
 
   orderingTexture: THREE.DataTexture | null = null;
   maxSplats = 0;
@@ -401,15 +404,14 @@ export class SparkRenderer extends THREE.Mesh {
   lodWorker: SplatWorker | null = null;
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
-  // Upload-driven traversal throttle: when the camera is stationary, at most
-  // one re-traversal is allowed to pick up newly uploaded pages. Subsequent
-  // uploads accumulate silently in the tree and are discovered on the next
-  // camera-driven traversal. This prevents ~300ms traversal bursts for every
-  // background chunk upload (87 × 300ms = 26s on MRNF10k), while still
-  // showing the user the first batch of content without requiring camera
-  // movement.
+  // Upload-driven traversal throttle: while the camera is stationary and
+  // chunks are still streaming, allow one upload-driven traversal at most
+  // every 2.5 seconds OR after 8 newly uploaded pages, whichever comes first.
+  // One final traversal is always allowed when the fetch queue empties
+  // (so the last chunks are never stranded until camera motion).
   _cameraMovedSinceLastTraversal = true;
-  _uploadDrivenTraversalDone = false;
+  _lastUploadDrivenTraversalTime = 0;
+  _pagesUploadedSinceLastTraversal = 0;
   lodIds: Map<
     PackedSplats | ExtSplats | PagedSplats,
     { lodId: number; lastTouched: number; rootPage?: number }
@@ -744,6 +746,15 @@ export class SparkRenderer extends THREE.Mesh {
       this.dirty = true;
       this.onDirty?.();
     }
+    this._needsRender = true;
+  }
+
+  needsRender(): boolean {
+    return this._needsRender;
+  }
+
+  markRendered() {
+    this._needsRender = false;
   }
 
   onBeforeRender(
@@ -1210,7 +1221,7 @@ export class SparkRenderer extends THREE.Mesh {
       if (similarity < 0.999) {
         this.lodDirty = true;
         this._cameraMovedSinceLastTraversal = true;
-        this._uploadDrivenTraversalDone = false;
+        this._needsRender = true;
       }
     }
 
@@ -1346,16 +1357,27 @@ export class SparkRenderer extends THREE.Mesh {
         const lodUpdates = this.lodUpdates;
         this.lodUpdates = [];
         await worker.call("updateLodTrees", { ranges: lodUpdates });
-        // Throttle upload-driven traversals: if the camera hasn't moved,
-        // allow exactly one follow-up traversal to pick up newly uploaded
-        // content (so the user sees SOMETHING without shaking the camera),
-        // then defer until the camera actually moves.
+        this._pagesUploadedSinceLastTraversal += lodUpdates.length;
+        // Throttle upload-driven traversals: while the camera is stationary,
+        // allow one every T=2.5s OR after K=8 newly uploaded pages, plus
+        // one final traversal when the fetch queue empties.
         if (this._cameraMovedSinceLastTraversal) {
           this.lodDirty = true;
-          this._uploadDrivenTraversalDone = false;
-        } else if (!this._uploadDrivenTraversalDone) {
-          this.lodDirty = true;
-          this._uploadDrivenTraversalDone = true;
+        } else {
+          const now = performance.now();
+          const timeSince = now - this._lastUploadDrivenTraversalTime;
+          const fetchQueueEmpty = this.pager && this.pager.fetchers.length === 0
+            && this.pager.fetched.length === 0
+            && this.pager.fetchPriority.every(p => this.pager
+              ? !!this.pager.getSplatsChunk(p.splats as PagedSplats, p.chunk) : true);
+          const UPLOAD_TRAVERSE_INTERVAL_MS = 2500;
+          const UPLOAD_TRAVERSE_PAGE_THRESHOLD = 8;
+          if (fetchQueueEmpty || timeSince >= UPLOAD_TRAVERSE_INTERVAL_MS
+              || this._pagesUploadedSinceLastTraversal >= UPLOAD_TRAVERSE_PAGE_THRESHOLD) {
+            this.lodDirty = true;
+            this._lastUploadDrivenTraversalTime = now;
+            this._pagesUploadedSinceLastTraversal = 0;
+          }
         }
       }
 
@@ -1579,6 +1601,18 @@ export class SparkRenderer extends THREE.Mesh {
 
     this.updateLodIndices(uuidToMesh, keyIndices);
     // console.log("chunks.length =", chunks.length);
+
+    // Task 2: refresh the cut-membership set for eviction protection.
+    // Pages containing actively-visible splats are never evicted.
+    if (this.pager) {
+      const pages = this.pager.pagesInCut;
+      pages.clear();
+      for (const { indices, numSplats } of Object.values(keyIndices)) {
+        for (let i = 0; i < numSplats; i++) {
+          pages.add(indices[i] >>> 16);
+        }
+      }
+    }
 
     if (this.pager) {
       this.pager.processUploads();

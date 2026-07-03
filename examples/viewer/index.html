@@ -355,7 +355,15 @@
         const cls = _fpsAvg < 15 ? 'bad' : _fpsAvg < 30 ? 'low' : '';
         fpsEl.className = 'fps-counter' + (cls ? ' ' + cls : '');
       }
-      renderer.render(scene, camera);
+      // Render-on-demand: only call renderer.render() when the scene changed.
+      // When the camera is stationary and all chunks are loaded, the GPU idles.
+      // The update logic (driveLod/driveSort) runs via the explicit spark.update()
+      // call below, independent of rendering.
+      spark.update({ scene, camera });
+      if (spark.needsRender()) {
+        spark.markRendered();
+        renderer.render(scene, camera);
+      }
     });
 
     // Handle drag and drop files.
@@ -667,6 +675,13 @@
       const maxCacheSplats = parseInt(document.querySelector('#max-cache-splats')?.value || "16777216");
       const backgroundPrefetch = document.querySelector('#background-prefetch')?.checked || false;
 
+      // Task 4: Apply budget knobs — read from dropdowns and set on the
+      // SparkRenderer before loading the file. Refresh the page to change.
+      const lodSplatCountVal = parseInt(document.querySelector('#lod-splat-count')?.value || "2500000");
+      spark.lodSplatCount = lodSplatCountVal > 0 ? lodSplatCountVal : undefined;
+      spark.lodRenderScale = parseFloat(document.querySelector('#lod-pixel-threshold')?.value || "1.0");
+      console.log(`[budget] lodSplatCount=${spark.lodSplatCount ?? 'default'}, lodRenderScale=${spark.lodRenderScale}`);
+
       fileName = splatFile.name;
       setSplatFile({
         fileBlob: splatFile,
@@ -799,6 +814,32 @@
         <label style="display: flex; align-items: center; gap: 8px;">
           Max Cache Splats:
           <input id="max-cache-splats" type="number" value="16777216" style="background: #222; border: 1px solid #444; color: #fff; padding: 4px; border-radius: 4px; width: 120px; font-family: monospace;" />
+        </label>
+        <!--
+          Budget knobs (Task 4): control LOD splat ceiling and pixel threshold
+          from the viewer without code edits. Higher threshold = fewer splats =
+          lower GPU load ~1/τ². Refresh the page after changing to re-init the
+          SparkRenderer with the new values.
+        -->
+        <label style="display: flex; align-items: center; gap: 8px;">
+          Splat Budget:
+          <select id="lod-splat-count" style="background: #222; border: 1px solid #444; color: #fff; padding: 4px; border-radius: 4px; font-family: monospace;">
+            <option value="500000">500K (mobile)</option>
+            <option value="1000000">1M</option>
+            <option value="1500000">1.5M</option>
+            <option value="2500000" selected>2.5M (desktop)</option>
+            <option value="5000000">5M</option>
+            <option value="0">unlimited</option>
+          </select>
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px;">
+          Pixel Threshold:
+          <select id="lod-pixel-threshold" style="background: #222; border: 1px solid #444; color: #fff; padding: 4px; border-radius: 4px; font-family: monospace;">
+            <option value="1.0" selected>1.0 px</option>
+            <option value="1.5">1.5 px</option>
+            <option value="2.0">2.0 px</option>
+            <option value="3.0">3.0 px</option>
+          </select>
         </label>
       </div>
     </div>

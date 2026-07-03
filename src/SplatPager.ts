@@ -848,6 +848,9 @@ export class SplatPager {
     data: PackedResult | ExtResult;
   }[];
   fetchPriority: { splats: PagedSplats; chunk: number }[];
+  // Pages referenced by the current LOD traversal output (the active cut).
+  // These pages are never evicted — they contain actively visible content.
+  pagesInCut: Set<number> = new Set();
 
   packedTexture: dyno.DynoUsampler2DArray<
     "packedTexture",
@@ -1565,31 +1568,31 @@ export class SplatPager {
   }
 
   private allocateFreeable(): number | undefined {
-    const page = this.freeablePages.shift();
-    if (page === undefined) {
-      // No freeable pages available
-      return undefined;
+    // Try pages in freeable order, skipping any currently in the active LOD
+    // cut — evicting a page the user is looking at causes visible popping.
+    while (this.freeablePages.length > 0) {
+      const page = this.freeablePages.shift()!;
+      if (this.pagesInCut.has(page)) {
+        continue; // skip, leave this page alone
+      }
+      const splatsChunk = this.pageToSplatsChunk[page];
+      if (!splatsChunk) {
+        throw new Error(`splatsChunk not found for page: ${page}`);
+      }
+      const { splats, chunk } = splatsChunk;
+      const pageAge = (performance.now() - splatsChunk.time).toFixed(0);
+      console.log(
+        `[pager-evict] evicting page=${page} chunk=${chunk} age=${pageAge}ms ` +
+        `(freeable=${this.freeablePages.length}, totalLRU=${this.pageLru.size})`,
+      );
+      this.removeSplatsChunkPage(splats, chunk, page);
+      this.lodTreeUpdates.push({
+        splats, page, chunk,
+        numSplats: PAGE_SPLATS,
+      });
+      return page;
     }
-
-    const splatsChunk = this.pageToSplatsChunk[page];
-    if (!splatsChunk) {
-      throw new Error(`splatsChunk not found for page: ${page}`);
-    }
-
-    const { splats, chunk } = splatsChunk;
-    const pageAge = (performance.now() - splatsChunk.time).toFixed(0);
-    console.log(
-      `[pager-evict] evicting page=${page} chunk=${chunk} age=${pageAge}ms ` +
-      `(freeable=${this.freeablePages.length + 1}, totalLRU=${this.pageLru.size})`,
-    );
-    this.removeSplatsChunkPage(splats, chunk, page);
-    this.lodTreeUpdates.push({
-      splats,
-      page,
-      chunk,
-      numSplats: PAGE_SPLATS,
-    });
-    return page;
+    return undefined;
   }
 
   private processFetched() {
