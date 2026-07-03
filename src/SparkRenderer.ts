@@ -1607,7 +1607,7 @@ export class SparkRenderer extends THREE.Mesh {
         result = (await worker.call("traverseLodTrees", {
           maxSplats, pixelScaleLimit, lastPixelLimit: this.lastPixelLimit,
           instances, traverseMode: this.lodTraverseMode,
-          pageBounds: pageBounds?.slice(),
+          pageBounds: pageBounds?.slice(), seedCut: true,
         })) as any;
       } else {
         result = repairResult;

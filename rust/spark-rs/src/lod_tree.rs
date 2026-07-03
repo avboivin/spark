@@ -1112,10 +1112,13 @@ pub fn repair_lod_cut(
         if !needs_full {
             for inst in 0..num_instances {
                 if old_cuts[inst].is_empty() { needs_full = true; break; }
+                // Camera jump beyond incremental repair band: more than 50 units
+                // or >15° requires a full re-seed. Smaller movements are handled
+                // by re-keying only cut-boundary nodes.
                 if state.last_cut_origins.len() > inst {
                     let d = instances[inst].4.distance(state.last_cut_origins[inst]);
                     let dot = instances[inst].5.dot(state.last_cut_forwards[inst]);
-                    if d > 1.0 || (1.0 - dot).abs() > 0.004 { needs_full = true; break; }
+                    if d > 50.0 || (1.0 - dot).abs() > 0.035 { needs_full = true; break; }
                 }
             }
         }
