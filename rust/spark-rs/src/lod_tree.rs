@@ -165,6 +165,19 @@ struct LodState {
     buffer: Vec<u32>,
     last_expanded: AHashSet<(u32, u32, u32)>,
     current_expanded: AHashSet<(u32, u32, u32)>,
+    // P2a — Incremental cut repair state (ROAM dual-queue).
+    // cut_nodes[inst_index].get(paged_index) → pixel_scale for each
+    // node in the current LOD cut. Populated by traverse_lod_trees as
+    // the seed; updated incrementally by repair_lod_cut.
+    cut_nodes: Vec<AHashMap<u32, f32>>,
+    // Last full-cut seed parameters — when the camera moves far enough
+    // that incremental repair is unreliable, fall back to full traversal.
+    last_cut_origins: Vec<Vec3A>,
+    last_cut_forwards: Vec<Vec3A>,
+    last_cut_limits: Vec<f32>,
+    // Delta output scratch: (added[], removed[]) per instance
+    cut_delta_added: Vec<Vec<u32>>,
+    cut_delta_removed: Vec<Vec<u32>>,
 }
 
 impl LodState {
@@ -179,6 +192,12 @@ impl LodState {
             buffer: Vec::new(),
             last_expanded: AHashSet::new(),
             current_expanded: AHashSet::new(),
+            cut_nodes: Vec::new(),
+            last_cut_origins: Vec::new(),
+            last_cut_forwards: Vec::new(),
+            last_cut_limits: Vec::new(),
+            cut_delta_added: Vec::new(),
+            cut_delta_removed: Vec::new(),
         }
     }
 }
@@ -691,6 +710,54 @@ pub fn traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
+
+        // P2a: Save cut state and compute deltas vs previous cut.
+        // Snapshot old cuts, reinitialize for the new output.
+        let old_cuts = std::mem::take(&mut state.cut_nodes);
+        state.cut_nodes.resize(num_instances, AHashMap::new());
+        state.last_cut_origins.resize(num_instances, Vec3A::ZERO);
+        state.last_cut_forwards.resize(num_instances, Vec3A::ZERO);
+        state.last_cut_limits.resize(num_instances, 0.0);
+        state.cut_delta_added.resize(num_instances, Vec::new());
+        state.cut_delta_removed.resize(num_instances, Vec::new());
+
+        for (inst_index, instance_output) in instance_outputs.iter().enumerate() {
+            let (_, splats, ..) = &instances[inst_index];
+            let mut new_set = AHashSet::with_capacity(instance_output.len());
+            for &paged_index in instance_output.iter() {
+                new_set.insert(paged_index);
+                let ps = compute_pixel_scale(&splats[paged_index as usize], &instances[inst_index]);
+                state.cut_nodes[inst_index].insert(paged_index, ps);
+            }
+            state.cut_delta_added[inst_index].clear();
+            state.cut_delta_removed[inst_index].clear();
+            if inst_index < old_cuts.len() && !old_cuts[inst_index].is_empty() {
+                let old_cut = &old_cuts[inst_index];
+                for &paged_index in instance_output.iter() {
+                    if !old_cut.contains_key(&paged_index) {
+                        state.cut_delta_added[inst_index].push(paged_index);
+                    }
+                }
+                for (&paged_index, _) in old_cut.iter() {
+                    if !new_set.contains(&paged_index) {
+                        state.cut_delta_removed[inst_index].push(paged_index);
+                    }
+                }
+            }
+            state.last_cut_origins[inst_index] = instances[inst_index].4;
+            state.last_cut_forwards[inst_index] = instances[inst_index].5;
+            state.last_cut_limits[inst_index] = pixel_scale_limit;
+        }
+
+        // Serialize deltas to the result object
+        let cut_delta_added_arr = Array::new();
+        let cut_delta_removed_arr = Array::new();
+        for inst in 0..num_instances {
+            cut_delta_added_arr.push(&JsValue::from(Uint32Array::from(state.cut_delta_added[inst].as_slice())));
+            cut_delta_removed_arr.push(&JsValue::from(Uint32Array::from(state.cut_delta_removed[inst].as_slice())));
+        }
+        Reflect::set(&result, &JsValue::from_str("cutDeltaAdded"), &JsValue::from(cut_delta_added_arr)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("cutDeltaRemoved"), &JsValue::from(cut_delta_removed_arr)).unwrap();
 
         std::mem::swap(last_expanded, current_expanded);
         current_expanded.clear();
