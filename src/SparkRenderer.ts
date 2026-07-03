@@ -1366,14 +1366,15 @@ export class SparkRenderer extends THREE.Mesh {
         } else {
           const now = performance.now();
           const timeSince = now - this._lastUploadDrivenTraversalTime;
+          const hasNewPages = this._pagesUploadedSinceLastTraversal > 0;
           const fetchQueueEmpty = this.pager && this.pager.fetchers.length === 0
             && this.pager.fetched.length === 0
             && this.pager.fetchPriority.every(p => this.pager
               ? !!this.pager.getSplatsChunk(p.splats as PagedSplats, p.chunk) : true);
           const UPLOAD_TRAVERSE_INTERVAL_MS = 2500;
           const UPLOAD_TRAVERSE_PAGE_THRESHOLD = 8;
-          if (fetchQueueEmpty || timeSince >= UPLOAD_TRAVERSE_INTERVAL_MS
-              || this._pagesUploadedSinceLastTraversal >= UPLOAD_TRAVERSE_PAGE_THRESHOLD) {
+          if (hasNewPages && (fetchQueueEmpty || timeSince >= UPLOAD_TRAVERSE_INTERVAL_MS
+              || this._pagesUploadedSinceLastTraversal >= UPLOAD_TRAVERSE_PAGE_THRESHOLD)) {
             this.lodDirty = true;
             this._lastUploadDrivenTraversalTime = now;
             this._pagesUploadedSinceLastTraversal = 0;
