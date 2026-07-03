@@ -1062,18 +1062,28 @@ export async function decodeSp5Chunk({
     for (let i = 0; i < u16.length; i++) {
       xyzRawFloat[i] = halfToFloat(u16[i]);
     }
-    // Undo converter.ts's chunk-local normalization (see its chunkXyz comment):
-    // positions were packed as (raw - chunk_center) / chunk_scale to keep them
-    // within f16 range even when a chunk (e.g. chunk 0's coarsest LOD levels)
-    // spans the entire scene. Older files without these fields packed raw
-    // absolute positions directly, so default to a no-op transform.
+    // Undo converter.ts's chunk-local normalization. Positions are packed as
+    // (raw - chunk_center[d]) / chunk_scale[d] ∈ [-60000, 60000] for safe f16.
+    // For backward compat, old files without chunk_half_extent use scalar
+    // chunk_scale; files without either field have raw world-space positions.
     const chunkCenter: [number, number, number] = manifest.chunk_center ?? [0, 0, 0];
-    const chunkScale: number = manifest.chunk_scale ?? 1;
-    if (chunkScale !== 1 || chunkCenter[0] !== 0 || chunkCenter[1] !== 0 || chunkCenter[2] !== 0) {
+    const hasHalfExt = Array.isArray(manifest.chunk_half_extent) && manifest.chunk_half_extent.length === 3;
+    const hasScale = typeof manifest.chunk_scale === 'number';
+    if (hasHalfExt) {
+      const sx = manifest.chunk_half_extent[0] / 60000;
+      const sy = manifest.chunk_half_extent[1] / 60000;
+      const sz = manifest.chunk_half_extent[2] / 60000;
       for (let i = 0; i < count; i++) {
-        xyzRawFloat[i * 3 + 0] = xyzRawFloat[i * 3 + 0] * chunkScale + chunkCenter[0];
-        xyzRawFloat[i * 3 + 1] = xyzRawFloat[i * 3 + 1] * chunkScale + chunkCenter[1];
-        xyzRawFloat[i * 3 + 2] = xyzRawFloat[i * 3 + 2] * chunkScale + chunkCenter[2];
+        xyzRawFloat[i * 3 + 0] = xyzRawFloat[i * 3 + 0] * sx + chunkCenter[0];
+        xyzRawFloat[i * 3 + 1] = xyzRawFloat[i * 3 + 1] * sy + chunkCenter[1];
+        xyzRawFloat[i * 3 + 2] = xyzRawFloat[i * 3 + 2] * sz + chunkCenter[2];
+      }
+    } else if (hasScale) {
+      const s = manifest.chunk_scale;
+      for (let i = 0; i < count; i++) {
+        xyzRawFloat[i * 3 + 0] = xyzRawFloat[i * 3 + 0] * s + chunkCenter[0];
+        xyzRawFloat[i * 3 + 1] = xyzRawFloat[i * 3 + 1] * s + chunkCenter[1];
+        xyzRawFloat[i * 3 + 2] = xyzRawFloat[i * 3 + 2] * s + chunkCenter[2];
       }
     }
   } else {

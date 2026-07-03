@@ -453,13 +453,24 @@ export async function convertSplatToSp5Client({
     const chunkCenter: [number, number, number] = count > 0
       ? [(cMinX + cMaxX) / 2, (cMinY + cMaxY) / 2, (cMinZ + cMaxZ) / 2]
       : [0, 0, 0];
-    const halfExtent = count > 0 ? Math.max(cMaxX - cMinX, cMaxY - cMinY, cMaxZ - cMinZ) / 2 : 0;
+    // Per-axis half-extent for even precision across all dimensions.
+    // Normalization: (pos - center[d]) / half_extent[d] ∈ [-1, 1].
+    // After this, positions are in [-F16_SAFE_MAX, F16_SAFE_MAX] for
+    // f16 packing (F16_SAFE_MAX = 60000 < 65504 f16 limit).
+    const halfExtentX = count > 0 ? (cMaxX - cMinX) / 2 : 1;
+    const halfExtentY = count > 0 ? (cMaxY - cMinY) / 2 : 1;
+    const halfExtentZ = count > 0 ? (cMaxZ - cMinZ) / 2 : 1;
+    // Scalar scale kept for backward compat (approximates the per-axis values)
+    const halfExtent = Math.max(halfExtentX, halfExtentY, halfExtentZ);
     const chunkScale = Math.max(halfExtent, 1e-6) / F16_SAFE_MAX;
+    const sx = Math.max(halfExtentX, 1e-6) / F16_SAFE_MAX;
+    const sy = Math.max(halfExtentY, 1e-6) / F16_SAFE_MAX;
+    const sz = Math.max(halfExtentZ, 1e-6) / F16_SAFE_MAX;
     const chunkXyz = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
-      chunkXyz[i * 3 + 0] = (chunkXyzRaw[i * 3 + 0] - chunkCenter[0]) / chunkScale;
-      chunkXyz[i * 3 + 1] = (chunkXyzRaw[i * 3 + 1] - chunkCenter[1]) / chunkScale;
-      chunkXyz[i * 3 + 2] = (chunkXyzRaw[i * 3 + 2] - chunkCenter[2]) / chunkScale;
+      chunkXyz[i * 3 + 0] = (chunkXyzRaw[i * 3 + 0] - chunkCenter[0]) / sx;
+      chunkXyz[i * 3 + 1] = (chunkXyzRaw[i * 3 + 1] - chunkCenter[1]) / sy;
+      chunkXyz[i * 3 + 2] = (chunkXyzRaw[i * 3 + 2] - chunkCenter[2]) / sz;
     }
     const chunkOpacity = reorderedOpacity.subarray(start, start + count);
     const chunkRgb = reorderedRgb.subarray(start * 3, (start + count) * 3);
@@ -541,7 +552,7 @@ export async function convertSplatToSp5Client({
     // Positions (uncompressed, chunk-local-normalized -- see chunkXyz comment above)
     chunkMeta.xyz_uncompressed = packArray(chunkXyz);
     chunkMeta.chunk_center = chunkCenter;
-    chunkMeta.chunk_scale = chunkScale;
+    chunkMeta.chunk_half_extent = [halfExtentX, halfExtentY, halfExtentZ];
 
     // Codebooks
     scaleCodebooks.forEach(cb => {
