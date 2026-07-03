@@ -463,6 +463,7 @@ pub fn traverse_lod_trees(
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     page_bounds: Option<Box<[f32]>>,  // optional prefilter data, 5*N per page
+    seed_cut: Option<bool>,  // P2a: whether to seed incremental repair state
 ) -> anyhow::Result<Object, JsValue> {
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
@@ -721,7 +722,10 @@ pub fn traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
 
         // P2a: Save cut state and compute deltas vs previous cut.
-        // Snapshot old cuts, reinitialize for the new output.
+        // Only seed when explicitly requested; raycast traversals pass false
+        // to avoid clobbering the main rendering cut.
+        let seed = seed_cut.unwrap_or(true);
+        if seed {
         let old_cuts = std::mem::take(&mut state.cut_nodes);
         state.cut_nodes.resize(num_instances, AHashMap::new());
         state.last_cut_origins.resize(num_instances, Vec3A::ZERO);
@@ -767,6 +771,7 @@ pub fn traverse_lod_trees(
         }
         Reflect::set(&result, &JsValue::from_str("cutDeltaAdded"), &JsValue::from(cut_delta_added_arr)).unwrap();
         Reflect::set(&result, &JsValue::from_str("cutDeltaRemoved"), &JsValue::from(cut_delta_removed_arr)).unwrap();
+        } // end if seed
 
         std::mem::swap(last_expanded, current_expanded);
         current_expanded.clear();

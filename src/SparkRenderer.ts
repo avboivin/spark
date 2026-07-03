@@ -1619,6 +1619,7 @@ export class SparkRenderer extends THREE.Mesh {
         maxSplats, pixelScaleLimit, lastPixelLimit: this.lastPixelLimit,
         instances, traverseMode: this.lodTraverseMode,
         pageBounds: pageBounds?.slice(),
+        seedCut: true,
       })) as any;
     }
 

@@ -761,32 +761,18 @@ function updateLodTrees({
 }
 
 function traverseLodTrees({
-  maxSplats,
-  pixelScaleLimit,
-  lastPixelLimit,
-  instances,
-  traverseMode,
-  pageBounds,
+  maxSplats, pixelScaleLimit, lastPixelLimit,
+  instances, traverseMode, pageBounds, seedCut,
 }: {
-  maxSplats: number;
-  pixelScaleLimit: number;
-  lastPixelLimit?: number;
-  instances: Record<
-    string,
-    {
-      instanceId: string;
-      lodId: number;
-      rootPage?: number;
-      viewToObjectCols: number[];
-      lodScale: number;
-      behindFoveate: number;
-      coneFov0: number;
-      coneFov: number;
-      coneFoveate: number;
-    }
-  >;
+  maxSplats: number; pixelScaleLimit: number; lastPixelLimit?: number;
+  instances: Record<string, {
+    instanceId: string; lodId: number; rootPage?: number;
+    viewToObjectCols: number[]; lodScale: number;
+    behindFoveate: number; coneFov0: number; coneFov: number; coneFoveate: number;
+  }>;
   traverseMode: "dynamic" | "standard";
-  pageBounds?: Float32Array; // 5*N per page: (cx,cy,cz,radius,max_node_size)
+  pageBounds?: Float32Array;
+  seedCut?: boolean;  // P2a: seed incremental cut state (skip for raycast)
 }) {
   const keyInstances = Object.entries(instances);
   const lodIds = new Uint32Array(
@@ -836,6 +822,7 @@ function traverseLodTrees({
     coneFov0s,
     coneFovs,
     pageBounds ?? new Float32Array(0),
+    seedCut,
   ) as {
     instanceIndices: {
       lodId: number;
