@@ -1213,9 +1213,20 @@ export class SparkRenderer extends THREE.Mesh {
         this.lodDirty = true;
       }
 
-      const distance = viewPos.distanceTo(this.lastLod.pos);
+      let distance = viewPos.distanceTo(this.lastLod.pos);
+      // Dead-zone for sub-pixel drift: PointerControls' exponentially-decaying
+      // velocity (src/controls.ts:778) approaches zero asymptotically but never
+      // reaches it, accumulating ~0.03 units over a 0.5s idle render interval.
+      // Clamping distances below 0.005 units prevents this drift from triggering
+      // spurious traversals while still detecting intentional camera motion.
+      if (distance < 0.005) distance = 0;
       const distanceRamp = Math.max(0.0, 1.0 - distance / 1.0);
-      const dot = viewQuat.dot(this.lastLod.quat);
+      let dot = viewQuat.dot(this.lastLod.quat);
+      // Dead-zone for orientation: quaternion dot products above 0.99999
+      // correspond to angular differences < 0.25°, filtering the asymptotic
+      // rotation drift from PointerControls without suppressing intentional
+      // looking-around.
+      if (dot > 0.99999) dot = 1.0;
       const quatRamp = Math.max(0.0, 1.0 - (1.0 - dot) / 0.01);
       const similarity = distanceRamp * quatRamp;
       if (similarity < 0.999) {
