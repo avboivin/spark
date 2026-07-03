@@ -681,10 +681,15 @@ pub fn traverse_lod_trees(
 
         for (inst_index, instance_output) in instance_outputs.iter_mut().enumerate() {
             // instance_output.sort_unstable();
-            let rows = instance_output.len().div_ceil(16384);
+            // P2b: encode blend weight bits [31:24] for continuous LOD interpolation.
+            // Currently all nodes get w=255 (fully visible); future versions will
+            // compute w = smoothstep(refine_limit, coarsen_limit, pixel_scale) * 255
+            // for nodes inside the hysteresis band [0.9τ, 1.15τ].
+            let encoded: Vec<u32> = instance_output.iter().map(|&pi| pi | 0xFF000000).collect();
+            let rows = encoded.len().div_ceil(16384);
             let capacity = rows * 16384;
             let output = Uint32Array::new_with_length(capacity as u32);
-            output.subarray(0, instance_output.len() as u32).copy_from(&instance_output);
+            output.subarray(0, encoded.len() as u32).copy_from(&encoded);
 
             let result = Object::new();
             let lod_id = instances[inst_index].0;
@@ -1186,7 +1191,7 @@ pub fn repair_lod_cut(
         let instance_indices = Array::new();
         for inst in 0..num_instances {
             let rows = output_sets[inst].len().div_ceil(16384);
-            let indices: Vec<u32> = output_sets[inst].iter().map(|(pi, _)| *pi).collect();
+            let indices: Vec<u32> = output_sets[inst].iter().map(|(pi, _)| *pi | 0xFF000000).collect();
             let output = Uint32Array::new_with_length((rows * 16384) as u32);
             output.subarray(0, indices.len() as u32).copy_from(&indices);
             let r = Object::new();

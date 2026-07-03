@@ -1014,3 +1014,67 @@ as applicable). No adjective-only claims. If a measured result contradicts the p
 prediction by >2x either way, STOP and report before proceeding to the next item.
 ```
 
+---
+
+# APPENDIX A — Log Analysis 2026-07-03 (MRNF10k, 3070 Ti, Background Prefetch OFF)
+
+> **Scene:** MRNF10k-sp5.zip (5M gaussians, ~87 chunks)
+> **Hardware:** i7-12700K / 3070 Ti / 32GB
+> **Settings:** lodSplatCount=2.5M, pixelThreshold=1.0px, backgroundPrefetch=OFF
+
+### A.1 Raw Metrics
+
+| Metric | Avg | p50 | p95 | p99 | Count |
+|---|---|---|---|---|---|
+| Startup | **1075ms** | — | — | — | — |
+| Traversal RPC | 233ms | 211ms | 415ms | 554ms | 119 |
+| Frame time | 117.6ms | 133.4ms | 151.7ms | 188.1ms | 28 |
+| Huffman decode | 46.6ms | 45ms | 62ms | 77ms | 98 |
+| WASM reconstruct | 28.7ms | 28ms | 35ms | 43ms | 98 |
+| Freeable pages | avg 2.1 | max 9 | — | — | 94 samples |
+| GPU idle | **10-15%** | — | — | — | user-reported |
+
+### A.2 User Marker Intervals
+
+| Event | Time | Interval |
+|---|---|---|
+| File drop | — | — |
+| ARRIVE #1 | 12:44:33 | — |
+| DONE-GOOD #1 | 12:44:36 | **2.9s** |
+| ARRIVE #2 | 12:44:40 | — |
+| DONE-GOOD #2 | 12:44:48 | **7.9s** |
+| ARRIVE #3 | 12:44:52 | — |
+| DONE-GOOD #3 | 12:45:03 | **11.2s** |
+
+### A.3 Key Findings
+
+**1. Dead-zone fix eliminated idle traversal thrash.**
+Previous log (before fix): 288 traversals in 120s, uniform 281-330ms cadence even when stationary. This log: 119 traversals in ~50s, widely varying intervals (p50=211ms, range 58-693ms). The wider variance confirms traversals are triggered by actual events (camera movement, uploads) rather than a fixed-interval timer. User confirms "no buggy tree traversal while idle noticed."
+
+**2. Upload-driven traversals still fire after settling.**
+After DONE-GOOD #3 (12:45:03), 9 traversals continue from 12:45:11 to 12:45:19. The `freeable=9` pages and active fetches suggest the time-based upload throttle (every 2.5s / 8 pages) is still cycling. This is working as designed — the throttle allows progressive refinement during ongoing streaming. Once all chunks complete (fetch queue empty), the final traversal fires and then stops.
+
+**3. GPU idle at 10-15% confirms render-on-demand working.**
+The render throttle (2fps idle) drops GPU from 80%+ to 10-15%. This matches SuperSplat's idle behavior. Remaining GPU usage is likely from the 2fps render pass + browser compositing.
+
+**4. Startup at 1075ms matches the target.**
+First traversal at 12:44:29.347, camera-fit settled at 1075ms. The event-driven camera-fit (one poll) is working correctly.
+
+**5. Frame time at 117.6ms avg is dominated by traversal.**
+Each frame that includes a traversal pays ~211ms for the traversal + ~16ms GPU work. The render throttle (2fps idle) means only 28 frames over 50s were actually rendered — the rest were skipped because `needsRender()` returned false.
+
+**6. Compression pipeline stable.**
+Huffman decode at 46.6ms avg (5 streams × 9.3ms each). WASM reconstruct at 28.7ms. Both stable and consistent. No decode errors, no detached ArrayBuffer crashes.
+
+### A.4 Remaining Work (from §13)
+
+| Priority | Item | Status |
+|---|---|---|
+| P0+P1 done | Auto-dynamic, prefilter, per-axis normalization, WASM Huffman, throttle, dead-zone | ✅ |
+| P2a | Incremental cut repair (Rust done, JS wiring pending) | ⚠️ |
+| P2b | Continuous LOD interpolation (blend weights) | ❌ |
+| P3a | Mobile budget (lodSplatCount → 500K, pixelThreshold → 1.5-2px) | ❌ |
+| P3b | Distance-banded SH degree | ❌ |
+| P3c | Track C2 MLP appearance | ❌ |
+| P3d | Convert-time importance pruning | ❌ |
+
