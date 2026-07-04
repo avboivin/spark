@@ -1,8 +1,8 @@
 # IMPLEMENTATION_WORK.md — Resumable State Document
 
-> **Last updated:** 2026-07-04 14:00 UTC
+> **Last updated:** 2026-07-04 14:15 UTC
 > **Branch:** `flux-gs-test`
-> **Current build:** commit `0e61571` (Step A: dynamic cut seed fix)
+> **Current build:** Step A repair gate fix + Step B prefetch defer (pending commit)
 
 ---
 
@@ -17,9 +17,51 @@ node scripts/parse_perf_log.mjs <logfile>  # parse perf log
 
 ---
 
-## 1. Latest Log Analysis (13:46-13:47 UTC, MRNF10k, 2.5M budget, 1.0px, prefetch OFF)
+## 1. Latest Log Analysis (14:10-14:12 UTC, MRNF10k, 2.5M budget, 1.0px, prefetch OFF, build 0e61571)
 
-### 1.1 Comparison with Appendix A
+**Log:** `console-export-2026-7-4_10-12-20.log` (parsed via `parse_perf_log.mjs`)
+
+### 1.1 Key metrics
+
+| Metric | App C (prior) | This run (0e61571) | Delta |
+|---|---|---|---|
+| Startup | 1089ms | **1070ms** | ~same ✓ |
+| Traversal count | 151 | **91** | fewer (shorter session) |
+| Traversal avg | 268ms | **883ms** | **+229% worse** |
+| Traversal repair/full | n/a | **0 repair / 91 full** | **BUG: repair never ran** |
+| Traversal settled avg | 282-355ms | **1055ms** (last 20) | **+3× worse** |
+| Frame avg | 109.8ms | 119.9ms | ~same |
+| Huffman decode | 46.9ms | 48.2ms | ~same |
+
+### 1.2 ROOT CAUSE: repair path never entered (JS bug, not Rust)
+
+Dynamic cut seeding (0e61571) is correct — headless `sp5_repair_cut_seed_test` passes. Browser log shows **zero** `[perf-stall] repair traverse RPC` lines; all 91 traversals are `full`.
+
+**Bug:** `SparkRenderer.updateLod()` sets `_cameraMovedSinceLastTraversal = false` at line ~1418 *before* calling `updateLodInstances()`, but `updateLodInstances()` gated repair on `_hasCut && _cameraMovedSinceLastTraversal` — condition always false. Upload-driven traversals (camera stationary) also skipped repair, forcing expensive full dynamic traversals on every page upload (~883ms avg at 40+ pages).
+
+**Fix (same commit):** Try `repairLodCut` whenever `_hasCut`; fall back to full only on `needsFull`. Set `_hasCut = true` only after first cold-start full traversal.
+
+**Expected after fix:** repair/full split in perf log; settled repair RPC ≪ full (headless: 2ms on test scene; target <10ms at 40+ pages).
+
+### 1.3 ARRIVE→DONE intervals (user markers)
+
+| Run | Interval |
+|---|---|
+| #1 | 5.2s (41.153 → 46.323) |
+| #2 | 10.2s (50.474 → 60.651) |
+| #3 | 8.5s (05.675 → 14.192) |
+
+Slower than App C (2.7-7.4s) because every traversal was full (~500-1400ms) instead of incremental repair. User reported scene looked correct (DONE-GOOD ×3).
+
+### 1.4 Other observations
+
+- Traverse mode switch at 13 pages (14:10:37.714) — expected.
+- Startup healthy at 1070ms with prefetch OFF.
+- Step B (prefetch defer + burst cap) implemented same session; re-test with prefetch ON after rebuild.
+
+---
+
+## 1.x Prior Log Analysis (13:46-13:47 UTC, superseded)
 
 | Metric | App A (best) | App C (current) | Delta |
 |---|---|---|---|
@@ -82,9 +124,9 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 - [ ] **Free-list for index slots:** A simple `number[]` stack. When tombstoning, push slot to free-list. When adding, pop from free-list (if empty, append to end — grow the buffer).
 - [ ] **Delta-consistency test:** 100 scripted frames of rotation, assert `symmetric_diff(delta_applied_set, full_traversal_set) < 0.1%`.
 - [ ] **Merge-queue coarsening test:** camera pull-back must DECREASE cut size (split-only repair leaks splats).
-- [ ] **MRNF10k manual perf:** `parse_perf_log.mjs` shows repair/full split with repair dominant once settled; steady-state repair RPC < 10ms at 40+ pages.
+- [ ] **MRNF10k manual perf:** `parse_perf_log.mjs` shows repair/full split with repair dominant once settled; steady-state repair RPC < 10ms at 40+ pages. **Blocked on repair gate fix — re-test required.**
 
-**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, `0e61571`
+**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, `0e61571`, repair gate fix (pending)
 
 ---
 
@@ -111,14 +153,14 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 
 ---
 
-### Step 4 — P0 Fixes ❌ NOT STARTED
+### Step 4 — P0 Fixes ⚠️ PARTIAL
 
 **Intent:** Defer background prefetch until camera-fit settles (startup 4801ms → ~1100ms), and route prefetch through the same 3-active fetch cap as traversal-driven fetches.
 
-- [ ] `examples/viewer/index.html`: Move `backgroundPrefetch` flag check from `loadSplatFile` to AFTER `onSplatLoad` resolves (camera settled). Set `spark.pager.autoDrive = true` + call `driveFetchers()` only after camera-fit completes.
-- [ ] `src/SplatPager.ts runBackgroundPrefetch()`: Enqueue at most `numFetchers - activeFetchers` prefetch entries per call, instead of saturating all 3 slots immediately.
+- [x] `examples/viewer/index.html`: Enable `backgroundPrefetch` on pager only after `[camera-fit] settled` (not at load time).
+- [x] `src/SplatPager.ts runBackgroundPrefetch()`: Enqueue at most `numFetchers - activeFetchers` per call; added SP5 chunk support.
 
-**Acceptance:** Startup with prefetch ON matches prefetch OFF (~1100ms). Log shows prefetch fetches starting AFTER `[camera-fit] settled`.
+**Acceptance:** Startup with prefetch ON matches prefetch OFF (~1100ms). Log shows prefetch fetches starting AFTER `[camera-fit] settled`. **Re-test required.**
 
 ---
 
@@ -151,9 +193,10 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 | 1 | `| 0xFF000000` corrupts output indices | ✅ Fixed (Step 1) | Reverted |
 | 2 | Dead-zone may not be in user's build | ⚠️ Unconfirmed | Rebuild + hard-reload |
 | 3 | Traversals continue at ~320ms cadence when stationary | ⚠️ See #2 | Dead-zone fix should eliminate |
-| 4 | Dynamic mode never seeded cut → repair always `needsFull` | ✅ Fixed (Step A) | Port seeding to `dynamic_traverse_lod_trees` |
+| 4 | Dynamic mode never seeded cut → repair always `needsFull` | ✅ Fixed (0e61571) | Port seeding to `dynamic_traverse_lod_trees` |
+| 8 | Repair gate checked flag cleared before use → 0 repair in browser | ✅ Fixed (pending commit) | `_hasCut` only, not `_cameraMovedSinceLastTraversal` |
 | 5 | f16 clamp at ±65504 on GPU pack path | ⚠️ Pending Step 3 | snorm16 |
-| 6 | Background prefetch slows startup 4.5× | ⚠️ Pending Step 4 | Defer prefetch |
+| 6 | Background prefetch slows startup 4.5× | ⚠️ Fix shipped, re-test | Defer prefetch until camera-fit |
 | 7 | 5M splat budget excessive for MRNF10k | ✅ Fixed (P3a) | Mobile defaults 500K |
 
 ---

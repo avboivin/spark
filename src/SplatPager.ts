@@ -1447,55 +1447,69 @@ export class SplatPager {
   }
 
   private async runBackgroundPrefetch() {
+    let slots = this.numFetchers - this.fetchers.length;
+    if (slots <= 0) return;
+
     for (const splats of this.activeSplats) {
-      if (this.fetchers.length >= this.numFetchers) return;
+      if (slots <= 0) return;
+
+      let chunks: { count?: number }[] | undefined;
+      let spotId: string;
 
       if (splats.fileType === SplatFileType.RAD) {
-        let meta;
         try {
           const radMeta = await splats.getRadMeta();
-          meta = radMeta.meta;
-        } catch (e) {
+          chunks = radMeta.meta.chunks;
+        } catch {
           continue;
         }
-
-        const spotId =
+        spotId =
           splats.rootUrl ||
           (splats.fileBlob as any)?.name ||
           (splats.fileBytes as any)?.name ||
           "local-drop";
-        for (let chunk = 0; chunk < meta.chunks.length; chunk++) {
-          if (this.fetchers.length >= this.numFetchers) return;
+      } else if (splats.fileType === SplatFileType.SP5 && splats.cachedMeta?.chunks) {
+        chunks = splats.cachedMeta.chunks;
+        spotId =
+          splats.rootUrl ||
+          (splats.fileBlob as any)?.name ||
+          (splats.fileBytes as any)?.name ||
+          "local-drop";
+      } else {
+        continue;
+      }
 
-          // Check if already in priority list, fetching, or fetched
-          if (
-            this.fetchPriority.some(
-              (p) => p.splats === splats && p.chunk === chunk,
-            )
-          )
-            continue;
-          if (
-            this.fetchers.some((p) => p.splats === splats && p.chunk === chunk)
-          )
-            continue;
-          if (
-            this.fetched.some((p) => p.splats === splats && p.chunk === chunk)
-          )
-            continue;
-          if (this.splatsChunkToPage.get(splats)?.[chunk]) continue;
+      if (!chunks) continue;
 
-          // Query cache
-          const cached = await SplatCache.getChunk(spotId, chunk);
-          if (cached !== null) continue; // Already in cache!
+      for (let chunk = 0; chunk < chunks.length; chunk++) {
+        if (slots <= 0) return;
 
-          // Fetch and cache in background!
-          this.prefetchChunk(
-            splats,
-            chunk,
-            spotId,
-            meta.chunks[chunk].count || 0,
-          );
-        }
+        if (
+          this.fetchPriority.some(
+            (p) => p.splats === splats && p.chunk === chunk,
+          )
+        )
+          continue;
+        if (
+          this.fetchers.some((p) => p.splats === splats && p.chunk === chunk)
+        )
+          continue;
+        if (
+          this.fetched.some((p) => p.splats === splats && p.chunk === chunk)
+        )
+          continue;
+        if (this.splatsChunkToPage.get(splats)?.[chunk]) continue;
+
+        const cached = await SplatCache.getChunk(spotId, chunk);
+        if (cached !== null) continue;
+
+        this.prefetchChunk(
+          splats,
+          chunk,
+          spotId,
+          chunks[chunk].count || 0,
+        );
+        slots -= 1;
       }
     }
   }

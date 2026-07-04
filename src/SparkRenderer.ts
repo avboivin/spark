@@ -1591,8 +1591,9 @@ export class SparkRenderer extends THREE.Mesh {
     };
     let usedIncremental = false;
 
-    if (this._hasCut && this._cameraMovedSinceLastTraversal) {
-      // Camera moved within incremental repair band — try repair first
+    if (this._hasCut) {
+      // Try incremental repair whenever a cut exists; repair_lod_cut returns
+      // needsFull on cold start, camera teleport, or empty cut.
       const repairResult = await worker.call("repairLodCut", {
         maxSplats,
         pixelScaleLimit,
@@ -1617,13 +1618,13 @@ export class SparkRenderer extends THREE.Mesh {
         usedIncremental = true;
       }
     } else {
-      this._hasCut = true; // first full traversal seeds the cut
       result = (await worker.call("traverseLodTrees", {
         maxSplats, pixelScaleLimit, lastPixelLimit: this.lastPixelLimit,
         instances, traverseMode: this.lodTraverseMode,
         pageBounds: pageBounds?.slice(),
         seedCut: true,
       })) as any;
+      this._hasCut = true;
     }
 
     const traverseElapsed = performance.now() - traverseStart;

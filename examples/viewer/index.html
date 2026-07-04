@@ -661,6 +661,13 @@
         const numSplats = mesh.numSplats ?? 0;
         const pagesLoaded = splats?.pager?.pageToSplatsChunk?.filter((v) => v !== undefined)?.length ?? 0;
         console.log(`[camera-fit] scene now visible with ${numSplats} splats across ${pagesLoaded} pages`);
+        const prefetchEnabled = document.querySelector('#background-prefetch')?.checked || false;
+        if (prefetchEnabled && spark.pager) {
+          spark.pager.backgroundPrefetch = true;
+          spark.pager.autoDrive = true;
+          spark.pager.driveFetchers();
+          console.log('[camera-fit] background prefetch enabled after settle');
+        }
         await new Promise((resolve) => setTimeout(resolve, 1500));
         const laterBox = computeDensityBox(mesh, 0.5) || mesh.getBoundingBox();
         const laterWideBox = computeRobustBox(mesh, 0.5, 99.5) || mesh.getBoundingBox();
@@ -676,7 +683,7 @@
 
     async function loadSplatFile(splatFile) {
       const maxCacheSplats = parseInt(document.querySelector('#max-cache-splats')?.value || "16777216");
-      const backgroundPrefetch = document.querySelector('#background-prefetch')?.checked || false;
+      // backgroundPrefetch is enabled in onSplatLoad finished() after camera-fit settles
 
       // Task 4: Apply budget knobs — read from dropdowns and set on the
       // SparkRenderer before loading the file. Refresh the page to change.

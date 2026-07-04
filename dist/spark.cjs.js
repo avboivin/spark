@@ -12384,38 +12384,48 @@ const _SplatPager = class _SplatPager {
     }
   }
   async runBackgroundPrefetch() {
-    var _a2, _b2, _c;
+    var _a2, _b2, _c, _d, _e, _f;
+    let slots = this.numFetchers - this.fetchers.length;
+    if (slots <= 0) return;
     for (const splats of this.activeSplats) {
-      if (this.fetchers.length >= this.numFetchers) return;
+      if (slots <= 0) return;
+      let chunks;
+      let spotId;
       if (splats.fileType === SplatFileType.RAD) {
-        let meta;
         try {
           const radMeta = await splats.getRadMeta();
-          meta = radMeta.meta;
-        } catch (e) {
+          chunks = radMeta.meta.chunks;
+        } catch {
           continue;
         }
-        const spotId = splats.rootUrl || ((_a2 = splats.fileBlob) == null ? void 0 : _a2.name) || ((_b2 = splats.fileBytes) == null ? void 0 : _b2.name) || "local-drop";
-        for (let chunk = 0; chunk < meta.chunks.length; chunk++) {
-          if (this.fetchers.length >= this.numFetchers) return;
-          if (this.fetchPriority.some(
-            (p) => p.splats === splats && p.chunk === chunk
-          ))
-            continue;
-          if (this.fetchers.some((p) => p.splats === splats && p.chunk === chunk))
-            continue;
-          if (this.fetched.some((p) => p.splats === splats && p.chunk === chunk))
-            continue;
-          if ((_c = this.splatsChunkToPage.get(splats)) == null ? void 0 : _c[chunk]) continue;
-          const cached = await SplatCache.getChunk(spotId, chunk);
-          if (cached !== null) continue;
-          this.prefetchChunk(
-            splats,
-            chunk,
-            spotId,
-            meta.chunks[chunk].count || 0
-          );
-        }
+        spotId = splats.rootUrl || ((_a2 = splats.fileBlob) == null ? void 0 : _a2.name) || ((_b2 = splats.fileBytes) == null ? void 0 : _b2.name) || "local-drop";
+      } else if (splats.fileType === SplatFileType.SP5 && ((_c = splats.cachedMeta) == null ? void 0 : _c.chunks)) {
+        chunks = splats.cachedMeta.chunks;
+        spotId = splats.rootUrl || ((_d = splats.fileBlob) == null ? void 0 : _d.name) || ((_e = splats.fileBytes) == null ? void 0 : _e.name) || "local-drop";
+      } else {
+        continue;
+      }
+      if (!chunks) continue;
+      for (let chunk = 0; chunk < chunks.length; chunk++) {
+        if (slots <= 0) return;
+        if (this.fetchPriority.some(
+          (p) => p.splats === splats && p.chunk === chunk
+        ))
+          continue;
+        if (this.fetchers.some((p) => p.splats === splats && p.chunk === chunk))
+          continue;
+        if (this.fetched.some((p) => p.splats === splats && p.chunk === chunk))
+          continue;
+        if ((_f = this.splatsChunkToPage.get(splats)) == null ? void 0 : _f[chunk]) continue;
+        const cached = await SplatCache.getChunk(spotId, chunk);
+        if (cached !== null) continue;
+        this.prefetchChunk(
+          splats,
+          chunk,
+          spotId,
+          chunks[chunk].count || 0
+        );
+        slots -= 1;
       }
     }
   }
@@ -14905,7 +14915,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     const traverseStart = performance.now();
     let result;
     let usedIncremental = false;
-    if (this._hasCut && this._cameraMovedSinceLastTraversal) {
+    if (this._hasCut) {
       const repairResult = await worker.call("repairLodCut", {
         maxSplats,
         pixelScaleLimit,
@@ -14928,7 +14938,6 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         usedIncremental = true;
       }
     } else {
-      this._hasCut = true;
       result = await worker.call("traverseLodTrees", {
         maxSplats,
         pixelScaleLimit,
@@ -14938,6 +14947,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         pageBounds: pageBounds == null ? void 0 : pageBounds.slice(),
         seedCut: true
       });
+      this._hasCut = true;
     }
     const traverseElapsed = performance.now() - traverseStart;
     this.lastTraverseTime = traverseElapsed;
