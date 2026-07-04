@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-07-04 14:15 UTC
 > **Branch:** `flux-gs-test`
-> **Current build:** commit `2f83cc2` (repair gate fix + Step B prefetch defer)
+> **Current build:** commit `2ecd424` (hotfix: repair on camera-move only)
 
 ---
 
