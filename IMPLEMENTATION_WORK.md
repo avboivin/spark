@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-07-04 14:15 UTC
 > **Branch:** `flux-gs-test`
-> **Current build:** Step A repair gate fix + Step B prefetch defer (pending commit)
+> **Current build:** commit `2f83cc2` (repair gate fix + Step B prefetch defer)
 
 ---
 
@@ -126,7 +126,7 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 - [ ] **Merge-queue coarsening test:** camera pull-back must DECREASE cut size (split-only repair leaks splats).
 - [ ] **MRNF10k manual perf:** `parse_perf_log.mjs` shows repair/full split with repair dominant once settled; steady-state repair RPC < 10ms at 40+ pages. **Blocked on repair gate fix — re-test required.**
 
-**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, `0e61571`, repair gate fix (pending)
+**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, `0e61571`, `2f83cc2`
 
 ---
 
@@ -194,7 +194,7 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 | 2 | Dead-zone may not be in user's build | ⚠️ Unconfirmed | Rebuild + hard-reload |
 | 3 | Traversals continue at ~320ms cadence when stationary | ⚠️ See #2 | Dead-zone fix should eliminate |
 | 4 | Dynamic mode never seeded cut → repair always `needsFull` | ✅ Fixed (0e61571) | Port seeding to `dynamic_traverse_lod_trees` |
-| 8 | Repair gate checked flag cleared before use → 0 repair in browser | ✅ Fixed (pending commit) | `_hasCut` only, not `_cameraMovedSinceLastTraversal` |
+| 8 | Repair gate checked flag cleared before use → 0 repair in browser | ✅ Fixed (2f83cc2) | `_hasCut` only, not `_cameraMovedSinceLastTraversal` |
 | 5 | f16 clamp at ±65504 on GPU pack path | ⚠️ Pending Step 3 | snorm16 |
 | 6 | Background prefetch slows startup 4.5× | ⚠️ Fix shipped, re-test | Defer prefetch until camera-fit |
 | 7 | 5M splat budget excessive for MRNF10k | ✅ Fixed (P3a) | Mobile defaults 500K |
