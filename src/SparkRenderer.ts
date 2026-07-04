@@ -1155,15 +1155,18 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   defaultSplatTarget() {
+    // P3a: Reduced mobile budget from 1.5M to 500K — the τ⁻² law
+    // means a 1.75× higher pixel threshold cuts splat count ~3×, and the
+    // 500K budget ensures the GPU bandwidth ceiling is respected.
     return isOculus()
-      ? 500000
+      ? 300000  // was 500K
       : isVisionPro()
-        ? 750000
+        ? 400000  // was 750K
         : isAndroid()
-          ? 1000000
+          ? 500000  // was 1M
           : isIos()
-            ? 1500000
-            : 2500000;
+            ? 500000  // was 1.5M
+            : 2500000;  // desktop unchanged
   }
 
   private driveLod({
