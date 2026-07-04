@@ -1,8 +1,8 @@
 # IMPLEMENTATION_WORK.md — Resumable State Document
 
-> **Last updated:** 2026-07-03 09:50 UTC
+> **Last updated:** 2026-07-04 14:00 UTC
 > **Branch:** `flux-gs-test`
-> **Current build:** commit `6830daa` (Steps 1-2 partial, P2b reverted)
+> **Current build:** Step A in progress — dynamic cut seed fix (pending commit)
 
 ---
 
@@ -71,21 +71,20 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 **What's done:**
 - `LodState` has `cut_nodes`, `parent_map`, `last_cut_origins/forwards/limits`, `cut_delta_added/removed`
 - `traverse_lod_trees` seeds cut state + populates `parent_map` (child→parent links)
+- **`dynamic_traverse_lod_trees` now seeds cut state + `parent_map`** (2026-07-04): root cause of `needsFull` forever when resident pages > 10 (auto dynamic mode). Gated on `seed_cut` flag like standard mode.
 - `repair_lod_cut` function: cold-start detection, re-key, split queue (expand nodes above coarsen_limit), merge queue (coarsen complete sibling groups), budget enforcement, delta computation
 - `repairLodCut` worker handler wiring complete (`src/worker.ts`)
-- `repair_lod_cut` import added to worker.ts
+- **SparkRenderer.ts integration:** `updateLodInstances` tries `repairLodCut` when `_hasCut && _cameraMovedSinceLastTraversal`, falls back to full `traverseLodTrees` on `needsFull` (commits `cb52702`, `40aced0`, `1423c3b`)
+- **`sp5_repair_cut_seed_test.ts`:** dynamic seed → repair returns `needsFull=false`, 2.2ms on 2K-sphere test scene
 
 **What remains:**
-- [ ] **SparkRenderer.ts integration:** In `updateLodInstances`, after building instances+pageBounds, call `worker.call("repairLodCut", ...)` instead of "traverseLodTrees" when:
-  - (a) A cut exists (check via `this._hasCut` flag set after first full traversal)
-  - (b) Camera similarity is within incremental band (`similarity > 0.9`)
-  - (c) Resident page set only changed additively (new pages, no removes)
-  - On `needsFull` response, fall back to `worker.call("traverseLodTrees", ...)`
 - [ ] **Delta application in PagedSplats.update():** Accept `{ added: Uint32Array, removed: Uint32Array }`. For each `removed`: tombstone the index slot (push to free-list). For each `added`: write to first available free-list slot.
 - [ ] **Free-list for index slots:** A simple `number[]` stack. When tombstoning, push slot to free-list. When adding, pop from free-list (if empty, append to end — grow the buffer).
 - [ ] **Delta-consistency test:** 100 scripted frames of rotation, assert `symmetric_diff(delta_applied_set, full_traversal_set) < 0.1%`.
+- [ ] **Merge-queue coarsening test:** camera pull-back must DECREASE cut size (split-only repair leaks splats).
+- [ ] **MRNF10k manual perf:** `parse_perf_log.mjs` shows repair/full split with repair dominant once settled; steady-state repair RPC < 10ms at 40+ pages.
 
-**Commit:** `6830daa`
+**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, Step A fix (pending)
 
 ---
 
@@ -125,10 +124,10 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 
 ### Step 5 — P3 Mobile + C2 ❌ NOT STARTED
 
-**P3a (mobile budget):**
-- [ ] `SparkRenderer.ts defaultSplatTarget()`: Return 500K for `isMobile()` (was 1.5M)
-- [ ] `SparkRenderer.ts lodRenderScale` default: 1.0 for desktop, 1.5 for mobile
-- [ ] Adaptive: if scene half-extent < 1000 units, multiply `pixelScaleLimit` by 2.0 (small scene → higher threshold → fewer splats)
+**P3a (mobile budget):** ✅ DONE (`6bf7bf8`)
+- [x] `SparkRenderer.ts defaultSplatTarget()`: Android/iOS 500K, desktop 2.5M
+- [ ] `SparkRenderer.ts lodRenderScale` default: 1.0 for desktop, 0.75 for mobile (Step F)
+- [ ] Adaptive: if scene half-extent < 1000 units, multiply `pixelScaleLimit` by 2.0
 
 **P3b (SH banding):**
 - [ ] `SplatPager.ts`: At page-load time, compute `ℓ(d) = clamp(ceil(3 * d_ref / d), 0, maxSh)` where `d_ref = scene_half_extent / 8`. Only decode the needed SH bands into GPU memory.
@@ -152,14 +151,14 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 | 1 | `| 0xFF000000` corrupts output indices | ✅ Fixed (Step 1) | Reverted |
 | 2 | Dead-zone may not be in user's build | ⚠️ Unconfirmed | Rebuild + hard-reload |
 | 3 | Traversals continue at ~320ms cadence when stationary | ⚠️ See #2 | Dead-zone fix should eliminate |
-| 4 | `repair_lod_cut` not called from JS | ⚠️ Pending Step 2 | SparkRenderer wiring |
+| 4 | Dynamic mode never seeded cut → repair always `needsFull` | ✅ Fixed (Step A) | Port seeding to `dynamic_traverse_lod_trees` |
 | 5 | f16 clamp at ±65504 on GPU pack path | ⚠️ Pending Step 3 | snorm16 |
 | 6 | Background prefetch slows startup 4.5× | ⚠️ Pending Step 4 | Defer prefetch |
-| 7 | 5M splat budget excessive for MRNF10k | ⚠️ Pending Step 5 | P3a |
+| 7 | 5M splat budget excessive for MRNF10k | ✅ Fixed (P3a) | Mobile defaults 500K |
 
 ---
 
-## 4. Current Test Status (10 tests)
+## 4. Current Test Status (12 tests)
 
 | Test | Status |
 |---|---|
@@ -168,6 +167,7 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 | `sp5_ordering_test` | ✅ PASS |
 | `sp5_chunk_coherence_test` | ✅ PASS |
 | `sp5_hysteresis_stability_test` | ✅ PASS (incl. regression) |
+| `sp5_repair_cut_seed_test` | ✅ PASS |
 | `sp5_cross_chunk_test` | ✅ PASS |
 | `sp5_hierarchical_cross_chunk_test` | ✅ PASS |
 | `sp5_hierarchical_lod_test` | ✅ PASS |

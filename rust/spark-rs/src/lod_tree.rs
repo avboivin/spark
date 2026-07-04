@@ -818,8 +818,7 @@ pub fn dynamic_traverse_lod_trees(
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
     page_bounds: Option<Box<[f32]>>,  // optional prefilter data, 5*N per page
-    // readback: Uint32Array,
-    // flag: bool,
+    seed_cut: Option<bool>,  // P2a: whether to seed incremental repair state
 ) -> anyhow::Result<Object, JsValue> {
 
     let max_splats = max_splats as usize;
@@ -976,6 +975,11 @@ pub fn dynamic_traverse_lod_trees(
                         let child_chunk = (child >> 16) as usize;
                         let child_page = chunk_to_page[child_chunk];
                         let child_paged_index = (child_page << 16) | (child & 0xffff);
+                        // P2a: record parent→child mapping for merge-queue coarsening
+                        if inst_index as usize >= state.parent_map.len() {
+                            state.parent_map.resize(inst_index as usize + 1, AHashMap::new());
+                        }
+                        state.parent_map[inst_index as usize].insert(child_paged_index, paged_index);
                         let child_pixel_scale = compute_pixel_scale(&splats[child_paged_index as usize], instance);
                         let refine_limit = current_scale * 0.9;
                         let coarsen_limit = current_scale * 1.15;
@@ -1025,16 +1029,23 @@ pub fn dynamic_traverse_lod_trees(
         }).collect();
         touched.sort_unstable();
 
-        let instance_indices = Array::new();
+        let mut final_outputs: Vec<Vec<(u32, f32)>> = Vec::with_capacity(num_instances);
         let mut output_size = 0;
 
-        for (inst_index, (mut instance_output, frontier)) in outputs.into_iter().enumerate() {
+        for (instance_output, frontier) in outputs.into_iter() {
             output_size += frontier.len();
-            instance_output.extend(frontier);
+            let mut merged = instance_output;
+            merged.extend(frontier);
+            final_outputs.push(merged);
+        }
+
+        let instance_indices = Array::new();
+
+        for (inst_index, instance_output) in final_outputs.iter().enumerate() {
             let rows = instance_output.len().div_ceil(16384);
             let capacity = rows * 16384;
             let output = Uint32Array::new_with_length(capacity as u32);
-            let output_u32: Vec<u32> = instance_output.into_iter().map(|(paged_index, _)| paged_index).collect();
+            let output_u32: Vec<u32> = instance_output.iter().map(|(paged_index, _)| *paged_index).collect();
             output.subarray(0, output_u32.len() as u32).copy_from(&output_u32);
 
             let result = Object::new();
@@ -1061,6 +1072,55 @@ pub fn dynamic_traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
         Reflect::set(&result, &JsValue::from_str("missingCount"), &JsValue::from(missing_count)).unwrap();
+
+        // P2a: Save cut state and compute deltas vs previous cut (same as standard mode).
+        let seed = seed_cut.unwrap_or(true);
+        if seed {
+            let old_cuts = std::mem::take(&mut state.cut_nodes);
+            state.cut_nodes.resize(num_instances, AHashMap::new());
+            state.last_cut_origins.resize(num_instances, Vec3A::ZERO);
+            state.last_cut_forwards.resize(num_instances, Vec3A::ZERO);
+            state.last_cut_limits.resize(num_instances, 0.0);
+            state.cut_delta_added.resize(num_instances, Vec::new());
+            state.cut_delta_removed.resize(num_instances, Vec::new());
+
+            for (inst_index, instance_output) in final_outputs.iter().enumerate() {
+                let (_, splats, ..) = &instances[inst_index];
+                let mut new_set = AHashSet::with_capacity(instance_output.len());
+                for &(paged_index, _) in instance_output.iter() {
+                    new_set.insert(paged_index);
+                    let ps = compute_pixel_scale(&splats[paged_index as usize], &instances[inst_index]);
+                    state.cut_nodes[inst_index].insert(paged_index, ps);
+                }
+                state.cut_delta_added[inst_index].clear();
+                state.cut_delta_removed[inst_index].clear();
+                if inst_index < old_cuts.len() && !old_cuts[inst_index].is_empty() {
+                    let old_cut = &old_cuts[inst_index];
+                    for &(paged_index, _) in instance_output.iter() {
+                        if !old_cut.contains_key(&paged_index) {
+                            state.cut_delta_added[inst_index].push(paged_index);
+                        }
+                    }
+                    for (&paged_index, _) in old_cut.iter() {
+                        if !new_set.contains(&paged_index) {
+                            state.cut_delta_removed[inst_index].push(paged_index);
+                        }
+                    }
+                }
+                state.last_cut_origins[inst_index] = instances[inst_index].4;
+                state.last_cut_forwards[inst_index] = instances[inst_index].5;
+                state.last_cut_limits[inst_index] = pixel_scale_limit;
+            }
+
+            let cut_delta_added_arr = Array::new();
+            let cut_delta_removed_arr = Array::new();
+            for inst in 0..num_instances {
+                cut_delta_added_arr.push(&JsValue::from(Uint32Array::from(state.cut_delta_added[inst].as_slice())));
+                cut_delta_removed_arr.push(&JsValue::from(Uint32Array::from(state.cut_delta_removed[inst].as_slice())));
+            }
+            Reflect::set(&result, &JsValue::from_str("cutDeltaAdded"), &JsValue::from(cut_delta_added_arr)).unwrap();
+            Reflect::set(&result, &JsValue::from_str("cutDeltaRemoved"), &JsValue::from(cut_delta_removed_arr)).unwrap();
+        }
 
         std::mem::swap(last_expanded, current_expanded);
         current_expanded.clear();
