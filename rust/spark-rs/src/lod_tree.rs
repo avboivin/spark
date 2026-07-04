@@ -1184,6 +1184,9 @@ pub fn repair_lod_cut(
         }
 
         if needs_full {
+            // Restore cut state — mem::take above must not leave an empty cut
+            // when we fall back to a full re-seed on the JS side.
+            state.cut_nodes = old_cuts;
             let result = Object::new();
             Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(Array::new())).unwrap();
             Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(Array::new())).unwrap();

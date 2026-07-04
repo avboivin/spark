@@ -1415,6 +1415,7 @@ export class SparkRenderer extends THREE.Mesh {
           timestamp: now,
         };
         this.lodDirty = false;
+        const useRepair = this._hasCut && this._cameraMovedSinceLastTraversal;
         this._cameraMovedSinceLastTraversal = false;
 
         await this.updateLodInstances(
@@ -1425,6 +1426,7 @@ export class SparkRenderer extends THREE.Mesh {
           viewPos,
           viewQuat,
           pixelScaleLimit,
+          useRepair,
         );
         this.currentLod = this.lastLod;
         this.setDirty();
@@ -1466,6 +1468,7 @@ export class SparkRenderer extends THREE.Mesh {
     viewPos: THREE.Vector3,
     viewQuat: THREE.Quaternion,
     pixelScaleLimit: number,
+    useRepair: boolean,
   ) {
     // Commented out because it makes LoDing less stable
     // viewPos.add(deltaPred);
@@ -1591,9 +1594,10 @@ export class SparkRenderer extends THREE.Mesh {
     };
     let usedIncremental = false;
 
-    if (this._hasCut) {
-      // Try incremental repair whenever a cut exists; repair_lod_cut returns
-      // needsFull on cold start, camera teleport, or empty cut.
+    if (useRepair) {
+      // Incremental repair only when the camera moved within the repair band.
+      // Upload-driven traversals must use full traversal so newly resident pages
+      // are discovered via tree walk; repair only re-keys the existing cut.
       const repairResult = await worker.call("repairLodCut", {
         maxSplats,
         pixelScaleLimit,

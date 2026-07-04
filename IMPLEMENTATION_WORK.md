@@ -39,7 +39,9 @@ Dynamic cut seeding (0e61571) is correct — headless `sp5_repair_cut_seed_test`
 
 **Bug:** `SparkRenderer.updateLod()` sets `_cameraMovedSinceLastTraversal = false` at line ~1418 *before* calling `updateLodInstances()`, but `updateLodInstances()` gated repair on `_hasCut && _cameraMovedSinceLastTraversal` — condition always false. Upload-driven traversals (camera stationary) also skipped repair, forcing expensive full dynamic traversals on every page upload (~883ms avg at 40+ pages).
 
-**Fix (same commit):** Try `repairLodCut` whenever `_hasCut`; fall back to full only on `needsFull`. Set `_hasCut = true` only after first cold-start full traversal.
+**Fix (2f83cc2, broken):** Tried repair on every traversal including upload-driven — repair cannot discover newly uploaded pages, only re-keys existing cut → missing geometry.
+
+**Fix (pending):** Repair only when camera moved; capture flag before `_cameraMovedSinceLastTraversal` reset. Upload-driven → full traverse. Restore `cut_nodes` on repair `needsFull` early return.
 
 **Expected after fix:** repair/full split in perf log; settled repair RPC ≪ full (headless: 2ms on test scene; target <10ms at 40+ pages).
 
@@ -194,7 +196,8 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 | 2 | Dead-zone may not be in user's build | ⚠️ Unconfirmed | Rebuild + hard-reload |
 | 3 | Traversals continue at ~320ms cadence when stationary | ⚠️ See #2 | Dead-zone fix should eliminate |
 | 4 | Dynamic mode never seeded cut → repair always `needsFull` | ✅ Fixed (0e61571) | Port seeding to `dynamic_traverse_lod_trees` |
-| 8 | Repair gate checked flag cleared before use → 0 repair in browser | ✅ Fixed (2f83cc2) | `_hasCut` only, not `_cameraMovedSinceLastTraversal` |
+| 8 | Repair gate checked flag cleared before use → 0 repair in browser | ✅ Fixed | Capture flag before reset; repair on camera-move only |
+| 9 | Repair on upload-driven traversal → broken renderer (2f83cc2) | ✅ Fixed (pending) | Full traverse when camera stationary |
 | 5 | f16 clamp at ±65504 on GPU pack path | ⚠️ Pending Step 3 | snorm16 |
 | 6 | Background prefetch slows startup 4.5× | ⚠️ Fix shipped, re-test | Defer prefetch until camera-fit |
 | 7 | 5M splat budget excessive for MRNF10k | ✅ Fixed (P3a) | Mobile defaults 500K |
