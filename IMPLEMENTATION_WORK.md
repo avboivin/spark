@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-07-04 14:00 UTC
 > **Branch:** `flux-gs-test`
-> **Current build:** Step A in progress — dynamic cut seed fix (pending commit)
+> **Current build:** commit `0e61571` (Step A: dynamic cut seed fix)
 
 ---
 
@@ -84,7 +84,7 @@ Similar/better — the upload cadence + fetch pipeline is stable.
 - [ ] **Merge-queue coarsening test:** camera pull-back must DECREASE cut size (split-only repair leaks splats).
 - [ ] **MRNF10k manual perf:** `parse_perf_log.mjs` shows repair/full split with repair dominant once settled; steady-state repair RPC < 10ms at 40+ pages.
 
-**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, Step A fix (pending)
+**Commits:** `6830daa`, `cb52702`, `1423c3b`, `40aced0`, `0e61571`
 
 ---
 
