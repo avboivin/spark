@@ -323,6 +323,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     updateTimeoutId: number;
     onDirty?: () => void;
     dirty: boolean;
+    _needsRender: boolean;
     orderingTexture: THREE.DataTexture | null;
     maxSplats: number;
     activeSplats: number;
@@ -345,6 +346,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodRenderScale: number;
     lodInflate: boolean;
     lodTraverseMode: "dynamic" | "standard";
+    _lodTraverseModeExplicit: boolean;
     pagedExtSplats: boolean;
     maxPagedSplats: number;
     numLodFetchers: number;
@@ -361,6 +363,10 @@ export declare class SparkRenderer extends THREE.Mesh {
         version: number;
     }[];
     lodDirty: boolean;
+    _cameraMovedSinceLastTraversal: boolean;
+    _lastUploadDrivenTraversalTime: number;
+    _pagesUploadedSinceLastTraversal: number;
+    _hasCut: boolean;
     lodIds: Map<PackedSplats | ExtSplats | PagedSplats, {
         lodId: number;
         lastTouched: number;
@@ -399,8 +405,14 @@ export declare class SparkRenderer extends THREE.Mesh {
     }[];
     lastTraverseTime: number;
     lastPixelLimit?: number;
+    private _angVelQuats;
+    private _angVelMaxHistory;
     pager?: SplatPager;
     pagerId: number;
+    _pendingFetchChunks: {
+        splats: PagedSplats;
+        chunk: number;
+    }[];
     target?: THREE.WebGLRenderTarget;
     backTarget?: THREE.WebGLRenderTarget;
     superPixels?: Uint8Array;
@@ -506,6 +518,8 @@ export declare class SparkRenderer extends THREE.Mesh {
     };
     dispose(): void;
     setDirty(): void;
+    needsRender(): boolean;
+    markRendered(): void;
     onBeforeRender(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera): void;
     clearSplats(): void;
     update({ scene, camera, }: {
@@ -515,7 +529,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     private updateInternal;
     private driveSort;
     private ensureLodWorker;
-    defaultSplatTarget(): 500000 | 750000 | 1000000 | 1500000 | 2500000;
+    defaultSplatTarget(): 300000 | 400000 | 500000 | 2500000;
     private driveLod;
     private initLodTree;
     private pageSizeWarning;

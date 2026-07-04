@@ -178,6 +178,7 @@ export declare class SplatPager {
         splats: PagedSplats;
         chunk: number;
     }[];
+    pagesInCut: Set<number>;
     packedTexture: dyno.DynoUsampler2DArray<"packedTexture", THREE.DataArrayTexture>;
     extTexture: dyno.DynoUsampler2DArray<"extTexture", THREE.DataArrayTexture>;
     readonly shTextures: [
